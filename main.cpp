@@ -19,6 +19,40 @@
 //   Audio In 1/2: Ring-modulated with drone output
 //   Audio Out 1/2: Stereo drone output
 
+// Knob pickup: ignores the knob until it crosses near the current parameter
+// value, then tracks it. Prevents jumps when switching pages.
+struct KnobPickup
+{
+    int32_t value = 0;       // Current parameter value
+    bool picked_up = true;   // Whether the knob is actively tracking
+    static constexpr int32_t THRESHOLD = 80; // ~2% of 4095 range
+
+    // Call every sample with the raw knob reading.
+    // Returns the (possibly unchanged) parameter value.
+    int32_t update(int32_t knob_val)
+    {
+        if (picked_up)
+        {
+            value = knob_val;
+        }
+        else
+        {
+            // Check if knob has crossed near the stored value
+            int32_t diff = knob_val - value;
+            if (diff < 0) diff = -diff;
+            if (diff < THRESHOLD)
+            {
+                picked_up = true;
+                value = knob_val;
+            }
+        }
+        return value;
+    }
+
+    // Call when switching pages to release the knob
+    void release() { picked_up = false; }
+};
+
 class Siren : public ComputerCard
 {
 public:
@@ -35,6 +69,14 @@ public:
         basis_raw = 2048;  // ~110 Hz
 
         gate_open = true;  // start droning
+
+        // Initialize pickup values
+        knob_warp.value = warp_raw;
+        knob_span.value = span_raw;
+        knob_morph.value = morph_raw;
+        knob_seed.value = seed_raw;
+        knob_scan.value = scan_raw;
+        knob_basis.value = basis_raw;
     }
 
     virtual void __not_in_flash_func(ProcessSample)()
@@ -151,6 +193,10 @@ private:
     int32_t warp_raw, span_raw, morph_raw, seed_raw, scan_raw, basis_raw;
     int32_t seed_val = 0; // actual seed value (changes on trigger)
 
+    // Knob pickup instances (one per parameter)
+    KnobPickup knob_warp, knob_span, knob_morph;
+    KnobPickup knob_seed, knob_scan, knob_basis;
+
     // Parameter smoothers
     KnobSmoother warp_smooth, span_smooth, morph_smooth, scan_smooth, basis_smooth;
 
@@ -158,34 +204,62 @@ private:
     int32_t env_level = 0;
     bool gate_open;
 
-    // Switch state tracking for bank cycling
+    // Switch state tracking for bank cycling and page changes
     bool switch_was_down = false;
+    Switch last_page = Switch::Up; // track which page we were on
 
     // LED update counter (don't update every sample)
     uint16_t led_counter = 0;
 
-    // Bank names for reference:
-    // 0=SINE, 1=CLST, 2=DTON, 3=ANLG, 4=WSHP, 5=WAVE
-    static constexpr int led_map[6] = {0, 1, 2, 3, 4, 5};
+    // LED mapping: bank index -> LED index
+    // Physical layout is 2 columns x 3 rows:
+    //   0  1
+    //   2  3
+    //   4  5
+    // We map banks to read top-to-bottom, left-to-right:
+    //   bank0  bank1
+    //   bank2  bank3
+    //   bank4  bank5
+    static constexpr int led_for_bank[6] = {0, 1, 2, 3, 4, 5};
 
     void update_controls()
     {
         Switch sw = SwitchVal();
 
+        // Detect page change and release knobs so they need to be "picked up"
+        if (sw != Switch::Down && sw != last_page)
+        {
+            if (sw == Switch::Up)
+            {
+                // Switching TO page 1: release page 1 knobs
+                knob_warp.release();
+                knob_span.release();
+                knob_morph.release();
+            }
+            else if (sw == Switch::Middle)
+            {
+                // Switching TO page 2: release page 2 knobs
+                knob_seed.release();
+                knob_scan.release();
+                knob_basis.release();
+            }
+            last_page = sw;
+        }
+
         if (sw == Switch::Up)
         {
             // Page 1: WARP / SPAN / MORPH
-            warp_raw = KnobVal(Knob::Main);
-            span_raw = KnobVal(Knob::X);
-            morph_raw = KnobVal(Knob::Y);
+            warp_raw = knob_warp.update(KnobVal(Knob::Main));
+            span_raw = knob_span.update(KnobVal(Knob::X));
+            morph_raw = knob_morph.update(KnobVal(Knob::Y));
         }
         else if (sw == Switch::Middle)
         {
             // Page 2: SEED / SCAN / BASIS
-            seed_raw = KnobVal(Knob::Main);
+            seed_raw = knob_seed.update(KnobVal(Knob::Main));
             seed_val = seed_raw; // seed updates directly
-            scan_raw = KnobVal(Knob::X);
-            basis_raw = KnobVal(Knob::Y);
+            scan_raw = knob_scan.update(KnobVal(Knob::X));
+            basis_raw = knob_basis.update(KnobVal(Knob::Y));
         }
 
         // Switch down = momentary bank cycle
@@ -228,9 +302,9 @@ private:
         for (int i = 0; i < 6; i++)
         {
             if (i == current_bank)
-                LedBrightness(i, 4095);
+                LedBrightness(led_for_bank[i], 4095);
             else
-                LedOff(i);
+                LedOff(led_for_bank[i]);
         }
     }
 
