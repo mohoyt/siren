@@ -52,12 +52,16 @@ struct BankSine
 
         for (int i = 0; i < 4; i++)
         {
-            // Frequency: rootFreq * ratio * (1 + span * 0.05)
-            int32_t spread = 65536 + ((int32_t)p.span * 3); // Q16.16: 1.0 + span*~0.05
-            int64_t ratio = (int64_t)ratios_q16[i] * spread >> 16;
+            // SPAN: scale the deviation of each ratio from the fundamental
+            // At span=0, ratios are tight. At span=4095, deviations are doubled.
+            int32_t base_ratio = ratios_q16[i];
+            int32_t deviation = base_ratio - 65536; // how far from 1.0
+            // Scale deviation: 0.5x at span=0, 2.0x at span=4095
+            int32_t span_scale = 2048 + ((int32_t)p.span * 3 / 2); // Q12: 0.5 to ~1.5
+            int64_t ratio = 65536 + ((int64_t)deviation * span_scale >> 12);
 
-            // Seed affects per-oscillator detuning
-            int32_t seed_detune = 65536 + ((int32_t)p.seed * i * 4);
+            // Seed: per-oscillator detuning (moderate range, max ~5% per osc)
+            int32_t seed_detune = 65536 + ((int32_t)p.seed * i * 2);
             ratio = ratio * seed_detune >> 16;
 
             uint32_t inc = (uint32_t)((int64_t)p.basis_freq * ratio >> 16);
@@ -123,8 +127,9 @@ struct BankCluster
             int32_t offset = ((i * 2 - 3) * cluster_spread) >> 1;
             int32_t ratio = 65536 + offset; // Q16.16: 1.0 + offset
 
-            // Seed: per-oscillator variation
-            ratio += (int32_t)p.seed * i * 4;
+            // Seed: per-oscillator variation (moderate, asymmetric)
+            static constexpr int32_t clst_seed_scale[4] = {0, 3, -2, 5};
+            ratio += (int32_t)p.seed * clst_seed_scale[i];
 
             uint32_t inc = (uint32_t)((int64_t)p.basis_freq * ratio >> 16);
 
@@ -206,7 +211,8 @@ struct BankDiatonic
                 (((int64_t)(ratios_wide[i] - ratios_tight[i]) * span_blend) >> 12);
 
             // Seed: micro-detuning per oscillator
-            ratio += (int32_t)p.seed * i * 1;
+            static constexpr int32_t dton_seed_scale[4] = {0, 3, -2, 5};
+            ratio += (int32_t)p.seed * dton_seed_scale[i];
 
             uint32_t inc = (uint32_t)((int64_t)p.basis_freq * ratio >> 16);
             phase[i] += inc;
@@ -273,8 +279,10 @@ struct BankAnalogue
         // Two oscillators with detuning from span
         // freq1 = root * (1 + span * 0.02)
         // freq2 = root * (1 - span * 0.02 + seed * 0.01)
-        int32_t ratio1 = 65536 + ((int32_t)p.span * 3);        // ~1.0 + span*0.02
-        int32_t ratio2 = 65536 - ((int32_t)p.span * 3) + ((int32_t)p.seed * 1);
+        // SPAN: symmetric detuning between the two oscillators
+        int32_t ratio1 = 65536 + ((int32_t)p.span * 3);
+        // SEED: shifts osc2 relationship (max ~10% detune)
+        int32_t ratio2 = 65536 - ((int32_t)p.span * 3) + ((int32_t)p.seed * 4);
 
         uint32_t inc1 = (uint32_t)((int64_t)p.basis_freq * ratio1 >> 16);
         uint32_t inc2 = (uint32_t)((int64_t)p.basis_freq * ratio2 >> 16);
@@ -364,9 +372,10 @@ struct BankWaveshape
 
     void process(const OscParams& p, int16_t& out_l, int16_t& out_r)
     {
-        // Carrier at root, modulator at fifth relationship
-        // freq2 = root * (1.5 + span * 0.5)
-        int32_t ratio2 = 98304 + ((int32_t)p.span * 32); // Q16.16: 1.5 + span*0.5ish
+        // Carrier at root, modulator relationship controlled by SPAN
+        // span=0: fifth (1.5x), span=4095: octave+fifth (3.0x)
+        // Scaled so the range is musically useful without jumping to inharmonic
+        int32_t ratio2 = 98304 + ((int32_t)p.span * 16); // Q16.16: 1.5 to ~2.5
 
         uint32_t inc1 = p.basis_freq;
         uint32_t inc2 = (uint32_t)((int64_t)p.basis_freq * ratio2 >> 16);
@@ -405,8 +414,7 @@ struct BankWaveshape
         if (tanh_idx > 1023) tanh_idx = 1023;
         int16_t result = tanh_table[tanh_idx];
 
-        // SCAN: fold intensity
-        if (p.scan > 200)
+        // SCAN: fold intensity (continuous from 0)
         {
             int32_t fold_input = (int32_t)result * (4096 + p.scan * 2) >> 12;
             int32_t fold_idx = (fold_input >> 6) + 512;
@@ -415,8 +423,7 @@ struct BankWaveshape
             result = fold_table[fold_idx];
         }
 
-        // Seed: add 2nd harmonic
-        if (p.seed > 200)
+        // Seed: add 2nd harmonic (continuous from 0)
         {
             uint32_t h2_phase = phase[0] << 1;
             int16_t h2 = table_lookup(sine_table, h2_phase);
@@ -447,7 +454,8 @@ struct BankWavetable
         for (int i = 0; i < 4; i++)
         {
             // Frequency with span-based detuning and seed variation
-            int32_t detune = (i & 1) ? ((int32_t)p.span * 1) : (-(int32_t)p.span * 1);
+            // SPAN: alternating ± detuning, stronger on upper harmonics
+            int32_t detune = (i & 1) ? ((int32_t)p.span * (i + 1)) : (-(int32_t)p.span * (i + 1));
             // SEED: shifts harmonic ratios — at max seed, ratios drift significantly
             // Use different prime multipliers per osc for non-uniform detuning
             static constexpr int32_t seed_scale[4] = {0, 7, -5, 11};
@@ -490,11 +498,11 @@ struct BankWavetable
 
             if (p.warp < 2048)
             {
-                // WARP CCW: bit reduction
-                if (p.warp < 1800)
+                // WARP CCW: bit reduction (8-bit down to 2-bit)
+                int32_t bits = 8 - ((int32_t)p.warp * 6 >> 11); // use full 0-2047 range
+                if (bits < 2) bits = 2;
+                if (bits < 8)
                 {
-                    int32_t bits = 8 - ((int32_t)p.warp * 6 >> 12);
-                    if (bits < 2) bits = 2;
                     int32_t step = 32768 >> bits;
                     if (step > 0)
                         wave = (int16_t)(((int32_t)wave / step) * step);
