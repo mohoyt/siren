@@ -1,0 +1,121 @@
+# CLAUDE.md - Siren
+
+## Project Overview
+
+**Siren** is a multi-algorithm drone oscillator for the Music Thing Modular Workshop System Computer (RP2040-based Eurorack module). It's a port of the oscillator core from [vhikk-drone](https://github.com/moseshoyt/vhikk-drone) (a monome norns script), adapted for the Workshop Computer's hardware constraints and modular synthesis context.
+
+## Architecture
+
+### Platform Constraints
+- **CPU**: RP2040 dual-core ARM Cortex-M0+ @ 133 MHz, no hardware FPU
+- **RAM**: 262 KB total
+- **Audio**: 12-bit I/O at 48 kHz via SPI DAC
+- **Budget**: ~2,778 cycles per sample per core (~20 microseconds)
+
+### Design Decisions
+- **Fixed-point integer math throughout** — no floating point in the audio path
+- **One oscillator bank active at a time** — unlike the norns version which runs all 6 in parallel with SelectX crossfading
+- **No internal effects/LFOs** — the module lives in a modular system where external modules handle delays, reverbs, filters, and modulation
+- **Wavetable lookup** for all waveforms (sine, saw, triangle) with linear interpolation
+- **Lookup tables for nonlinearities** (tanh, wavefold) stored in flash
+
+### Files
+
+```
+siren/
+├── main.cpp              # Main application (ComputerCard subclass, control mapping, routing)
+├── oscillators.h         # 6 oscillator bank implementations (SINE, CLST, DTON, ANLG, WSHP, WAVE)
+├── wavetables.h          # 1024-point lookup tables + phase/frequency utilities
+├── dsp.h                 # Fixed-point math (Q15 multiply, clip, lerp, smoothing)
+├── ComputerCard.h        # Workshop Computer hardware abstraction (from upstream)
+├── CMakeLists.txt        # Pico SDK build configuration
+├── pico_sdk_import.cmake # SDK locator (from upstream)
+└── .gitignore
+```
+
+### Signal Flow
+
+```
+[Knobs/CV] → [Parameter Smoothing] → [Active Oscillator Bank (1 of 6)]
+    → [Envelope] → [Ring Mod with Audio Input (optional)]
+    → [Q15 to 12-bit conversion] → [Audio Out L/R]
+```
+
+### Fixed-Point Conventions
+- **Q15**: Signed 16-bit audio samples (-32768 to 32767 representing -1.0 to ~+1.0)
+- **Q16.16**: Signed 32-bit for frequency ratios and phase accumulators
+- **12-bit**: Hardware I/O range (-2048 to 2047) for audio, CV, and knob values (0-4095 unsigned)
+
+## Oscillator Banks
+
+Each bank is a struct with a `process(const OscParams&, int16_t& out_l, int16_t& out_r)` method. All banks respond to the same 6 parameters (WARP, SPAN, MORPH, SEED, SCAN, BASIS) but interpret them differently — this is core to the Vhikk X design philosophy.
+
+| Index | Struct | Oscs | Character |
+|-------|--------|------|-----------|
+| 0 | BankSine | 4 | Harmonic sine cluster with phase feedback |
+| 1 | BankCluster | 4 | Tight beating/phaser cluster |
+| 2 | BankDiatonic | 4 | Just intonation intervals with wavefold |
+| 3 | BankAnalogue | 2 | Cross-mod and ring-mod |
+| 4 | BankWaveshape | 2 | FM-like tanh waveshaping |
+| 5 | BankWavetable | 4 | Waveform scanning with bit reduction |
+
+## Control Mapping
+
+### Switch
+- **Up**: Knobs control WARP / SPAN / MORPH (Main / X / Y)
+- **Middle**: Knobs control SEED / SCAN / BASIS (Main / X / Y)
+- **Down (momentary)**: Cycle oscillator bank; LEDs show active bank
+
+### CV/Trigger
+- CV1 → pitch (added to BASIS)
+- CV2 → WARP modulation
+- Pulse1 → gate on/off
+- Pulse2 → randomize SEED
+
+### Audio Input
+- Audio In 1/2 → ring modulates left/right drone output
+
+## Development
+
+### Building
+Requires Pico SDK. Set `PICO_SDK_PATH` environment variable or use the VS Code extension.
+
+```bash
+mkdir build && cd build
+cmake ..
+make
+```
+
+### Making Changes
+
+1. **Adding/modifying oscillator banks**: Edit `oscillators.h`. Each bank is self-contained. Keep all DSP in integer math — no `float` or `double` in the audio path.
+2. **Adding parameters**: Add to `OscParams` struct, map in `update_controls()` in `main.cpp`.
+3. **Changing control mapping**: Edit `update_controls()` and `update_leds()` in `main.cpp`.
+4. **Wavetable changes**: Edit `init_wavetables()` in `wavetables.h`. Tables are computed at startup, stored in RAM.
+
+### Performance Guidelines
+- The `ProcessSample()` callback must complete in ~20 microseconds
+- Mark time-critical functions with `__not_in_flash_func()`
+- Avoid division in the audio path (use shifts or multiply-by-reciprocal)
+- Avoid `float`/`double` — software FPU emulation is 50-100x slower than integer
+- Test CPU headroom by toggling a GPIO pin in ProcessSample() and measuring with a scope
+
+### Relationship to vhikk-drone
+The oscillator algorithms in `oscillators.h` are integer-math ports of the SuperCollider UGen chains in `vhikk-drone/lib/Engine_VhikkDrone.sc`. Key differences:
+- SC's `SelectX.ar` crossfading between all 6 banks → hard switch with envelope fade
+- SC's `SinOsc.ar` → wavetable lookup with linear interpolation
+- SC's `.tanh` / `.fold2` → lookup table approximations
+- SC's `Lag.kr` → one-pole integer lowpass filter
+- No delay processors, LFOs, or mod matrix (handled by external modules)
+
+## Dependencies
+
+- [Raspberry Pi Pico SDK](https://github.com/raspberrypi/pico-sdk) (v2.1.1+)
+- [ComputerCard library](https://github.com/TomWhitwell/Workshop_Computer) (v0.2.7, included as header)
+
+## References
+
+- [Forge TME Vhikk X](https://www.forge-tme.com/product/vhikk-x/) — hardware inspiration
+- [Vhikk X Algorithms](https://forge-tme.com/vhikk-x/algos_launch.html) — algorithm descriptions
+- [Workshop Computer](https://www.musicthing.co.uk/Workshop-Computer/) — target hardware
+- [ComputerCard API](https://github.com/TomWhitwell/Workshop_Computer/tree/main/Demonstrations+HelloWorlds/PicoSDK/ComputerCard) — hardware abstraction
