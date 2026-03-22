@@ -230,15 +230,19 @@ private:
     uint16_t led_counter = 480;
 
     // LED mapping: bank index -> LED index
-    // Physical layout is 2 columns x 3 rows:
+    // ComputerCard documentation says:
     //   0  1
     //   2  3
     //   4  5
-    // We map banks to read top-to-bottom, left-to-right:
+    // But testing shows the columns are swapped on hardware, so:
+    //   1  0
+    //   3  2
+    //   5  4
+    // Map banks to read top-to-bottom, left-to-right:
     //   bank0  bank1
     //   bank2  bank3
     //   bank4  bank5
-    static constexpr int led_for_bank[6] = {0, 1, 2, 3, 4, 5};
+    static constexpr int led_for_bank[6] = {1, 0, 3, 2, 5, 4};
 
     void update_controls()
     {

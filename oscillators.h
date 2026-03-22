@@ -38,15 +38,26 @@ struct BankSine
     {
         int32_t mix_l = 0, mix_r = 0;
 
+        // MORPH: controls per-oscillator amplitude weighting
+        // 0 = emphasize fundamentals (oscs 0,1), 4095 = emphasize harmonics (oscs 2,3)
+        // Each osc gets a different gain based on morph position
+        int32_t gains[4];
+        gains[0] = 4095 - p.morph;                          // fundamental, fades out
+        gains[1] = (p.morph < 2048) ? p.morph * 2 : (4095 - p.morph) * 2; // peaks mid
+        gains[2] = (p.morph > 1365) ? (p.morph - 1365) * 3 / 2 : 0;      // rises late
+        gains[3] = p.morph;                                  // harmonics, fades in
+        // Normalize so total is roughly constant
+        int32_t gain_sum = gains[0] + gains[1] + gains[2] + gains[3];
+        if (gain_sum < 1) gain_sum = 1;
+
         for (int i = 0; i < 4; i++)
         {
             // Frequency: rootFreq * ratio * (1 + span * 0.05)
-            // span 0-4095 mapped to 0.0-0.05 spread factor
-            int32_t spread = 65536 + ((int32_t)p.span * 3); // Q16.16: 1.0 + span*0.05ish
+            int32_t spread = 65536 + ((int32_t)p.span * 3); // Q16.16: 1.0 + span*~0.05
             int64_t ratio = (int64_t)ratios_q16[i] * spread >> 16;
 
             // Seed affects per-oscillator detuning
-            int32_t seed_detune = 65536 + ((int32_t)p.seed * i * 1); // subtle per-osc
+            int32_t seed_detune = 65536 + ((int32_t)p.seed * i * 4);
             ratio = ratio * seed_detune >> 16;
 
             uint32_t inc = (uint32_t)((int64_t)p.basis_freq * ratio >> 16);
@@ -56,33 +67,34 @@ struct BankSine
             int16_t osc = table_lookup(sine_table, phase[i]);
 
             // WARP: phase feedback — re-read sine with osc output as phase offset
-            if (p.warp > 100)
+            // Gentle scaling: at max warp, feedback is ~±0.5 of a full cycle
+            if (p.warp > 50)
             {
-                uint32_t fb_phase = phase[i] + ((int32_t)osc * p.warp >> 6);
+                // Scale: osc (±32767) * warp (0-4095) >> 14 gives ±8191 max
+                // Then shift into phase accumulator range
+                int32_t fb_amount = (int32_t)osc * p.warp >> 14;
+                uint32_t fb_phase = phase[i] + (fb_amount << (PHASE_FRAC_BITS - 2));
                 osc = table_lookup(sine_table, fb_phase);
             }
 
+            // Apply morph gain
+            int32_t gained = (int32_t)osc * gains[i] * 4 / gain_sum;
+
             // Pan: spread oscillators across stereo field
-            // i=0: hard left, i=3: hard right
             int32_t pan = i * 1365; // 0, 1365, 2730, 4095
-            mix_l += ((int32_t)osc * (4095 - pan)) >> 14;
-            mix_r += ((int32_t)osc * pan) >> 14;
+            mix_l += (gained * (4095 - pan)) >> 14;
+            mix_r += (gained * pan) >> 14;
         }
 
-        // MORPH: subtle amplitude modulation between oscillators
-        // (simplified from SC's SinOsc.kr AM)
-        // Just apply a gentle emphasis shift based on morph
-
         // SCAN: inter-oscillator ring modulation
-        if (p.scan > 200)
+        if (p.scan > 100)
         {
-            // Approximate by mixing in product of first two oscs
             int16_t osc0 = table_lookup(sine_table, phase[0]);
             int16_t osc2 = table_lookup(sine_table, phase[2]);
             int32_t ring = q15_mul(osc0, osc2);
-            int32_t ring_amt = p.scan >> 2; // 0-1023
-            mix_l += ring * ring_amt >> 12;
-            mix_r += ring * ring_amt >> 12;
+            // Stronger scaling: scan 0-4095 maps to 0-1.0 mix amount
+            mix_l += (int32_t)ring * p.scan >> 12;
+            mix_r += (int32_t)ring * p.scan >> 12;
         }
 
         out_l = q15_clip(mix_l);
@@ -108,24 +120,25 @@ struct BankCluster
         for (int i = 0; i < 4; i++)
         {
             // Offset from center: (i - 1.5) * spread
-            int32_t offset = ((i * 2 - 3) * cluster_spread) >> 1; // centered
+            int32_t offset = ((i * 2 - 3) * cluster_spread) >> 1;
             int32_t ratio = 65536 + offset; // Q16.16: 1.0 + offset
 
             // Seed: per-oscillator variation
-            ratio += (int32_t)p.seed * i * 1;
+            ratio += (int32_t)p.seed * i * 4;
 
             uint32_t inc = (uint32_t)((int64_t)p.basis_freq * ratio >> 16);
 
-            // MORPH: scan offset per oscillator (slight frequency drift)
-            int32_t morph_offset = (int32_t)p.morph * (i + 1) * 2;
-            inc += morph_offset;
+            // MORPH: per-oscillator frequency offset creating beating pattern
+            // Each osc gets a different morph-scaled detuning
+            // At max morph, offsets are significant enough to create audible beating
+            int32_t morph_ratio = 65536 + ((int32_t)p.morph * (i * 2 - 3) * 3);
+            inc = (uint32_t)((int64_t)inc * morph_ratio >> 16);
 
             phase[i] += inc;
 
             // Waveform selection based on SCAN
-            // scan < 1365: sine, 1365-2730: tri, 2730+: saw
             int16_t wave;
-            int32_t scan_pos = (p.scan + i * 614) & 4095; // per-osc offset
+            int32_t scan_pos = (p.scan + i * 614) & 4095;
             if (scan_pos < 1365)
             {
                 int32_t blend = scan_pos * 3;
@@ -143,12 +156,15 @@ struct BankCluster
                 wave = table_lookup(saw_table, phase[i]);
             }
 
-            // WARP: phase modulation from a sub-oscillator
-            if (p.warp > 200)
+            // WARP: amplitude modulation from a sub-oscillator
+            // Creates harmonic thickening and distortion
+            if (p.warp > 100)
             {
                 uint32_t sub_phase = phase[i] >> 1; // half frequency
                 int16_t sub = table_lookup(sine_table, sub_phase);
-                wave = q15_clip((int32_t)wave + ((int32_t)wave * sub >> 15) * p.warp / 2731);
+                // Scale: at max warp, sub modulates the wave by ±100%
+                int32_t mod = ((int32_t)sub * p.warp) >> 12;
+                wave = q15_clip((int32_t)wave + ((int32_t)wave * mod >> 15));
             }
 
             // Pan across stereo field
@@ -210,24 +226,27 @@ struct BankDiatonic
                                table_lookup(saw_table, phase[i]), blend);
             }
 
-            // WARP: wavefold intensity
-            if (p.warp > 100)
+            // WARP: wavefold intensity (gradual onset)
+            // Smoothly scales from 1.0x to 4.0x drive, then folds
             {
-                // Scale signal up then fold
-                int32_t scaled = (int32_t)wave * (4096 + p.warp * 3) >> 12;
-                // Map to fold table: input range -2.0..+2.0 -> table index
-                int32_t fold_idx = (scaled >> 6) + 512; // center at 512
+                int32_t drive = 4096 + ((int32_t)p.warp * p.warp >> 10); // quadratic for smooth onset
+                int32_t scaled = (int32_t)wave * drive >> 12;
+                int32_t fold_idx = (scaled >> 6) + 512;
                 if (fold_idx < 0) fold_idx = 0;
                 if (fold_idx > 1023) fold_idx = 1023;
                 wave = fold_table[fold_idx];
             }
 
-            // SCAN: add 2nd harmonic
-            if (p.scan > 200)
+            // SCAN: add 2nd and 3rd harmonics for richer timbre
             {
-                uint32_t h2_phase = phase[i] << 1; // double freq
+                uint32_t h2_phase = phase[i] << 1;
                 int16_t h2 = table_lookup(sine_table, h2_phase);
-                wave = q15_clip((int32_t)wave + ((int32_t)h2 * p.scan >> 14));
+                uint32_t h3_phase = phase[i] * 3;
+                int16_t h3 = table_lookup(sine_table, h3_phase);
+                // scan 0-4095: h2 up to 50% mix, h3 up to 25% mix
+                int32_t h2_amt = (int32_t)h2 * p.scan >> 13;
+                int32_t h3_amt = (int32_t)h3 * p.scan >> 14;
+                wave = q15_clip((int32_t)wave + h2_amt + h3_amt);
             }
 
             // Pan across stereo (oscillators spread L to R)
@@ -294,20 +313,30 @@ struct BankAnalogue
 
         int16_t mixed;
 
-        if (p.warp < 2048)
+        // WARP: cross-modulation (low) blending into ring modulation (high)
+        // Crossfade zone around the midpoint (1500-2500) to avoid discontinuity
         {
-            // WARP CCW (0-2047): cross-modulation
-            // carrier * (1 + modulator * warp_amount)
-            int32_t mod_depth = p.warp * 2; // 0-4095 range
-            int32_t mod_signal = (int32_t)modulator * mod_depth >> 12;
-            mixed = q15_clip((int32_t)carrier + ((int32_t)carrier * mod_signal >> 15));
-        }
-        else
-        {
-            // WARP CW (2048-4095): ring modulation blend
-            int32_t ring_amt = (p.warp - 2048) * 2;
+            // Cross-mod amount: full at 0, fades out by 2500
+            int32_t xmod_amt = (p.warp < 2500) ? (2500 - p.warp) * 4095 / 2500 : 0;
+            int32_t mod_signal = (int32_t)modulator * xmod_amt >> 12;
+            int16_t xmod_out = q15_clip((int32_t)carrier + ((int32_t)carrier * mod_signal >> 15));
+
+            // Ring mod amount: zero below 1500, full by 4095
+            int32_t ring_amt = (p.warp > 1500) ? (p.warp - 1500) * 4095 / 2595 : 0;
+            if (ring_amt > 4095) ring_amt = 4095;
             int16_t ring = q15_mul(carrier, modulator);
-            mixed = q15_lerp(carrier, ring, ring_amt);
+            int16_t ring_out = q15_lerp(carrier, ring, ring_amt);
+
+            // Blend: in the crossfade zone both contribute
+            if (p.warp < 1500)
+                mixed = xmod_out;
+            else if (p.warp > 2500)
+                mixed = ring_out;
+            else
+            {
+                int32_t blend = (p.warp - 1500) * 4095 / 1000;
+                mixed = q15_lerp(xmod_out, ring_out, blend);
+            }
         }
 
         // Fold to prevent clipping
@@ -417,9 +446,13 @@ struct BankWavetable
 
         for (int i = 0; i < 4; i++)
         {
-            // Frequency with slight span-based detuning
+            // Frequency with span-based detuning and seed variation
             int32_t detune = (i & 1) ? ((int32_t)p.span * 1) : (-(int32_t)p.span * 1);
-            int32_t ratio = ratios[i] + detune;
+            // SEED: shifts harmonic ratios — at max seed, ratios drift significantly
+            // Use different prime multipliers per osc for non-uniform detuning
+            static constexpr int32_t seed_scale[4] = {0, 7, -5, 11};
+            int32_t seed_offset = (int32_t)p.seed * seed_scale[i];
+            int32_t ratio = ratios[i] + detune + seed_offset;
 
             uint32_t inc = (uint32_t)((int64_t)p.basis_freq * ratio >> 16);
             phase[i] += inc;
