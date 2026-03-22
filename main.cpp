@@ -209,7 +209,8 @@ private:
     Switch last_page = Switch::Up; // track which page we were on
 
     // LED update counter (don't update every sample)
-    uint16_t led_counter = 0;
+    // Start at threshold so LEDs update on the very first sample
+    uint16_t led_counter = 480;
 
     // LED mapping: bank index -> LED index
     // Physical layout is 2 columns x 3 rows:
