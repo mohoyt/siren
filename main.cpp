@@ -119,6 +119,20 @@ public:
             params.warp = cv_warp;
         }
 
+        // ─── Audio In 2: FM modulation ───
+        // Adds external signal as frequency modulation to the oscillators
+        if (Connected(Input::Audio2))
+        {
+            int16_t fm_in = AudioIn2(); // ±2048
+            // Scale FM depth by WARP amount — more WARP = more FM sensitivity
+            // At max WARP + full input: ±~10% frequency deviation
+            int32_t fm_offset = ((int32_t)fm_in * params.warp) >> 14;
+            // Apply as multiplicative ratio to basis_freq
+            // fm_offset is roughly ±500 at max, we want ±10% of basis_freq
+            int64_t fm_ratio = 65536 + ((int64_t)fm_offset << 4); // Q16.16
+            params.basis_freq = (uint32_t)((int64_t)params.basis_freq * fm_ratio >> 16);
+        }
+
         // ─── Generate audio ───
         int16_t out_l = 0, out_r = 0;
 
@@ -155,18 +169,21 @@ public:
             // Apply envelope
             out_l = q15_mul(out_l, (int16_t)env_level);
             out_r = q15_mul(out_r, (int16_t)env_level);
+        }
 
-            // Audio input ring modulation
-            if (Connected(Input::Audio1))
-            {
-                int16_t ain = bit12_to_q15(AudioIn1());
-                out_l = q15_mul(out_l, ain);
-            }
-            if (Connected(Input::Audio2))
-            {
-                int16_t ain = bit12_to_q15(AudioIn2());
-                out_r = q15_mul(out_r, ain);
-            }
+        // ─── Audio In 1: Processor input ───
+        // Runs external audio through waveshaping controlled by current params.
+        // Creates stereo from mono by applying slightly different processing
+        // to L and R channels. Summed with drone output.
+        if (Connected(Input::Audio1))
+        {
+            int16_t ain = bit12_to_q15(AudioIn1());
+
+            int16_t proc_l = process_input(ain, params, 0);
+            int16_t proc_r = process_input(ain, params, 1);
+
+            out_l = q15_clip((int32_t)out_l + proc_l);
+            out_r = q15_clip((int32_t)out_r + proc_r);
         }
 
         // Output (Q15 -> 12-bit)
@@ -307,6 +324,45 @@ private:
             else
                 LedOff(led_for_bank[i]);
         }
+    }
+
+    // Process external audio input through waveshaping chain.
+    // channel: 0=left, 1=right (applies slight offset for stereo image)
+    int16_t process_input(int16_t input, const OscParams& p, int channel)
+    {
+        int32_t sig = input;
+
+        // Stereo offset: slightly different drive/fold for L vs R
+        int32_t warp_offset = channel ? (p.warp + 200) : p.warp;
+        if (warp_offset > 4095) warp_offset = 4095;
+        int32_t scan_offset = channel ? p.scan : (p.scan + 150);
+        if (scan_offset > 4095) scan_offset = 4095;
+
+        // WARP: wavefold intensity (same as DTON bank wavefold)
+        if (warp_offset > 100)
+        {
+            int32_t scaled = sig * (4096 + warp_offset * 3) >> 12;
+            int32_t fold_idx = (scaled >> 6) + 512;
+            if (fold_idx < 0) fold_idx = 0;
+            if (fold_idx > 1023) fold_idx = 1023;
+            sig = fold_table[fold_idx];
+        }
+
+        // SCAN: tanh saturation
+        if (scan_offset > 100)
+        {
+            int32_t drive = sig * (4096 + scan_offset * 4) >> 12;
+            int32_t tanh_idx = (drive >> 7) + 512;
+            if (tanh_idx < 0) tanh_idx = 0;
+            if (tanh_idx > 1023) tanh_idx = 1023;
+            sig = tanh_table[tanh_idx];
+        }
+
+        // MORPH: blend between dry and processed (0 = fully processed, 4095 = more dry)
+        // This gives a way to control how much processing is applied
+        sig = q15_lerp((int16_t)sig, input, p.morph);
+
+        return (int16_t)sig;
     }
 
     // Approximate exponential frequency mapping

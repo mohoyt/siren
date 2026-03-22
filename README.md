@@ -44,12 +44,12 @@ The lit LED indicates which of the 6 banks is currently active.
 | **CV In 2** | WARP modulation |
 | **Pulse In 1** | Gate — drone on/off |
 | **Pulse In 2** | Trigger — randomize SEED |
-| **Audio In 1** | Ring modulates left output |
-| **Audio In 2** | Ring modulates right output |
+| **Audio In 1** | Processor input — external audio is waveshaped/folded by WARP and SCAN, blended by MORPH, summed with drone. Mono input creates stereo output via offset processing. |
+| **Audio In 2** | FM input — modulates oscillator frequencies. FM depth scales with WARP. Patch an LFO for vibrato or another oscillator for FM synthesis. |
 | **Audio Out 1** | Left audio output |
 | **Audio Out 2** | Right audio output |
 
-When no gate is patched to Pulse In 1, the drone runs continuously.
+When no gate is patched to Pulse In 1, the drone runs continuously. To use as a pure audio processor, gate the drone off via Pulse In 1 and patch audio into Audio In 1.
 
 ## Building
 

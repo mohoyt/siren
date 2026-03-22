@@ -36,9 +36,12 @@ siren/
 ### Signal Flow
 
 ```
+[Audio In 2 (FM)] → frequency modulation ──┐
 [Knobs/CV] → [Parameter Smoothing] → [Active Oscillator Bank (1 of 6)]
-    → [Envelope] → [Ring Mod with Audio Input (optional)]
-    → [Q15 to 12-bit conversion] → [Audio Out L/R]
+    → [Envelope] ──┐
+                    ├── [Sum] → [Q15 to 12-bit] → [Audio Out L/R]
+[Audio In 1] → [Wavefold (WARP) → Tanh (SCAN) → Dry/Wet (MORPH)] ──┘
+               (mono → stereo via offset processing)
 ```
 
 ### Fixed-Point Conventions
@@ -73,7 +76,8 @@ Each bank is a struct with a `process(const OscParams&, int16_t& out_l, int16_t&
 - Pulse2 → randomize SEED
 
 ### Audio Input
-- Audio In 1/2 → ring modulates left/right drone output
+- Audio In 1 → processor input: waveshaped/folded by WARP+SCAN, dry/wet via MORPH, summed with drone (stereo from mono via offset processing)
+- Audio In 2 → FM input: modulates oscillator frequencies, depth scales with WARP
 
 ## Development
 
