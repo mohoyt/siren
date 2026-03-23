@@ -218,7 +218,7 @@ private:
     bool gate_open;
 
     // Switch state tracking for bank cycling and page changes
-    bool switch_was_down = false;
+    bool switch_was_down = true; // assume down at boot to ignore initial state
     Switch last_page = Switch::Up; // track which page we were on
 
     // LED update counter (don't update every sample)
