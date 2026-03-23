@@ -186,6 +186,25 @@ public:
         AudioOut1(q15_to_12bit(out_l));
         AudioOut2(q15_to_12bit(out_r));
 
+        // ─── CV/Pulse outputs ───
+
+        // CV Out 1: Pitch CV (basis value mapped to ±2048 range)
+        // basis is 0-4095 from knob (0-8191 with CV), center at 2048
+        CVOut1((int16_t)(basis - 2048));
+
+        // CV Out 2: Envelope level (0-32767 → 0-2047)
+        CVOut2((int16_t)(env_level >> 4));
+
+        // Pulse outputs: derived from oscillator phase[0]
+        uint32_t osc_phase = get_phase0();
+        bool phase_msb = osc_phase >> 31;
+        // Pulse Out 1: sub-oscillator clock (high when MSB of phase is set)
+        PulseOut1(phase_msb);
+        // Pulse Out 2: 1/2 divider — toggle on each rising edge of MSB
+        if (phase_msb && !last_phase_msb) half_div_state = !half_div_state;
+        last_phase_msb = phase_msb;
+        PulseOut2(half_div_state);
+
         // ─── LEDs: show current bank ───
         update_leds();
     }
@@ -216,6 +235,10 @@ private:
     // Envelope
     int32_t env_level = 0;
     bool gate_open;
+
+    // Pulse output state for 1/2 divider
+    bool last_phase_msb = false;
+    bool half_div_state = false;
 
     // Switch state tracking for bank cycling and page changes
     bool switch_was_down = true; // assume down at boot to ignore initial state
@@ -308,6 +331,20 @@ private:
         }
     }
 
+    uint32_t get_phase0()
+    {
+        switch (current_bank)
+        {
+            case 0: return bank_sine.phase[0];
+            case 1: return bank_cluster.phase[0];
+            case 2: return bank_diatonic.phase[0];
+            case 3: return bank_analogue.phase[0];
+            case 4: return bank_waveshape.phase[0];
+            case 5: return bank_wavetable.phase[0];
+            default: return 0;
+        }
+    }
+
     void update_leds()
     {
         led_counter++;
@@ -372,17 +409,18 @@ private:
 
         // Split into octave and fraction
         // Each 1365 units = 1 octave (for 0-4095 = 3 octaves)
-        // For extended range (with CV): each 1365 = 1 octave
-        int32_t octave = input / 1365;
-        int32_t frac = input % 1365;
+        // Avoid division: 1/1365 ≈ 48/65536, so x/1365 ≈ x*48>>16
+        int32_t octave = (input * 48) >> 16;
+        if (octave > 6) octave = 6;
+        int32_t frac = input - octave * 1365;
 
         // Base frequency for each octave: 55, 110, 220, 440, 880...
-        int32_t base = 55;
-        for (int i = 0; i < octave && i < 6; i++) base <<= 1;
+        int32_t base = 55 << octave;
 
         // Linear interpolation within octave (approximate exponential)
         // Next octave frequency is base * 2
-        int32_t freq = base + ((base * frac) / 1365);
+        // base * frac / 1365 ≈ base * frac * 48 >> 16
+        int32_t freq = base + ((int32_t)((int64_t)base * frac * 48 >> 16));
 
         return freq;
     }

@@ -42,6 +42,11 @@ siren/
                     ├── [Sum] → [Q15 to 12-bit] → [Audio Out L/R]
 [Audio In 1] → [Wavefold (WARP) → Tanh (SCAN) → Dry/Wet (MORPH)] ──┘
                (mono → stereo via offset processing)
+
+[BASIS + CV1] ──────────────────────────────────→ [CV Out 1: Pitch CV]
+[Envelope level] ───────────────────────────────→ [CV Out 2: Envelope]
+[Oscillator phase[0] MSB] ─────────────────────→ [Pulse Out 1: Sub clock]
+[Oscillator phase[0] bit 30] ──────────────────→ [Pulse Out 2: 1/2 divider]
 ```
 
 ### Fixed-Point Conventions
@@ -66,15 +71,15 @@ Each bank is a struct with a `process(const OscParams&, int16_t& out_l, int16_t&
 
 **SINE** — Harmonic ratios [1, 1.5, 2, 3]. Phase feedback via WARP (scaled by `PHASE_FRAC_BITS` for proper accumulator range). SPAN scales each oscillator's deviation from fundamental (spreading, not shifting). MORPH weights per-oscillator amplitudes (fundamentals → upper harmonics) with gain normalization. SCAN adds inter-oscillator ring modulation.
 
-**CLST** — 4 tightly detuned oscillators. SPAN controls cluster width (unison → wide beating). WARP applies sub-oscillator amplitude modulation (`sub * p.warp >> 12`). MORPH applies per-oscillator frequency ratio offsets for different beating patterns. SCAN selects per-oscillator waveform (sine → tri → saw, offset per osc).
+**CLST** — 4 tightly detuned oscillators. SPAN controls cluster width (unison → wide beating). WARP applies sub-oscillator amplitude modulation (`sub * p.warp >> 12`). MORPH applies per-oscillator frequency ratio offsets for different beating patterns. SCAN selects per-oscillator waveform via circular scan (sine → tri → saw → sine, offset per osc).
 
-**DTON** — Just intonation intervals. SPAN crossfades between tight intervals (1, 3rd, 5th, 7th) and wide intervals (2nd, 4th, 6th, octave). WARP applies wavefold with quadratic drive onset (`p.warp * p.warp >> 10`) for smooth low-end response. SCAN adds 2nd and 3rd harmonics (50%/25% max). MORPH scans carrier waveform (sine → triangle → sawtooth).
+**DTON** — Just intonation intervals. SPAN crossfades between tight intervals (1, 3rd, 5th, 7th) and wide intervals (2nd, 4th, 6th, octave). WARP applies wavefold with quadratic drive onset (`p.warp * p.warp >> 10`) for smooth low-end response. SCAN adds 2nd harmonic (up to 75% mix). MORPH scans carrier waveform (sine → triangle → sawtooth).
 
 **ANLG** — 2 oscillators with detuning. WARP crossfades smoothly between cross-modulation (CCW) and ring modulation (CW) with a 1500-2500 blend zone (no midpoint discontinuity). SPAN controls symmetric detuning. MORPH scans waveform (sine → tri → saw). SCAN scans modulator waveform.
 
 **WSHP** — Carrier + modulator in ~fifth relationship. WARP controls FM modulation index (0.5x → 6x). SPAN sets modulator frequency ratio (`*16` scaling for 1.5x-2.5x range). MORPH scans carrier waveform. SCAN controls wavefold intensity (continuous from 0, no dead zone). SEED applies asymmetric detuning via prime multipliers.
 
-**WAVE** — 4 oscillators with harmonic ratios [1, 2, 3, 5]. WARP splits into bit reduction (CCW, full 0-2047 range) and frequency cross-modulation (CW). SPAN scales detuning per harmonic number (`*(i+1)` so upper partials spread more). MORPH scans wavetable position (sine → tri → saw → pulse). SCAN offsets wavetable position per oscillator + pulse width. SEED uses per-oscillator prime multipliers `{0, 7, -5, 11}` for asymmetric detuning.
+**WAVE** — 4 oscillators with harmonic ratios [1, 2, 3, 5]. WARP splits into bit reduction (CCW, full 0-2047 range) and frequency cross-modulation (CW). SPAN scales detuning per harmonic number (`*(i+1)` so upper partials spread more). MORPH scans wavetable position via circular scan (sine → tri → saw → pulse → sine). SCAN offsets wavetable position per oscillator + pulse width. SEED uses per-oscillator prime multipliers `{0, 7, -5, 11}` for asymmetric detuning.
 
 ### SEED Implementation
 
@@ -92,10 +97,14 @@ When switching between Up and Middle switch positions, knobs use pickup behavior
 - **Down (momentary)**: Cycle oscillator bank; LEDs show active bank
 
 ### CV/Trigger
-- CV1 → pitch (added to BASIS)
-- CV2 → WARP modulation
-- Pulse1 → gate on/off
-- Pulse2 → randomize SEED
+- CV In 1 → pitch (added to BASIS)
+- CV In 2 → WARP modulation
+- CV Out 1 → pitch CV (mirrors BASIS + CV1 modulation)
+- CV Out 2 → envelope level
+- Pulse In 1 → gate on/off
+- Pulse In 2 → randomize SEED
+- Pulse Out 1 → sub-oscillator clock (square wave at fundamental)
+- Pulse Out 2 → 1/2 divider (one octave below fundamental)
 
 ### Audio Input
 - Audio In 1 → processor input: waveshaped/folded by WARP+SCAN, dry/wet via MORPH, summed with drone (stereo from mono via offset processing)
