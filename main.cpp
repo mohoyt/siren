@@ -119,18 +119,14 @@ public:
             params.warp = cv_warp;
         }
 
-        // ─── Audio In 2: FM modulation ───
-        // Adds external signal as frequency modulation to the oscillators
+        // ─── Audio In 2: SPAN modulation ───
+        // External CV/audio modulates SPAN (detuning/spread)
         if (Connected(Input::Audio2))
         {
-            int16_t fm_in = AudioIn2(); // ±2048
-            // Scale FM depth by WARP amount — more WARP = more FM sensitivity
-            // At max WARP + full input: ±~10% frequency deviation
-            int32_t fm_offset = ((int32_t)fm_in * params.warp) >> 14;
-            // Apply as multiplicative ratio to basis_freq
-            // fm_offset is roughly ±500 at max, we want ±10% of basis_freq
-            int64_t fm_ratio = 65536 + ((int64_t)fm_offset << 4); // Q16.16
-            params.basis_freq = (uint32_t)((int64_t)params.basis_freq * fm_ratio >> 16);
+            int32_t cv_span = params.span + (AudioIn2() + 2048); // shift to 0-4095ish
+            if (cv_span < 0) cv_span = 0;
+            if (cv_span > 4095) cv_span = 4095;
+            params.span = cv_span;
         }
 
         // ─── Generate audio ───
@@ -230,19 +226,12 @@ private:
     uint16_t led_counter = 480;
 
     // LED mapping: bank index -> LED index
-    // ComputerCard documentation says:
+    // ComputerCard layout (top-to-bottom, left-to-right):
     //   0  1
     //   2  3
     //   4  5
-    // But testing shows the columns are swapped on hardware, so:
-    //   1  0
-    //   3  2
-    //   5  4
-    // Map banks to read top-to-bottom, left-to-right:
-    //   bank0  bank1
-    //   bank2  bank3
-    //   bank4  bank5
-    static constexpr int led_for_bank[6] = {1, 0, 3, 2, 5, 4};
+    // Banks map directly: bank 0 = top-left, bank 1 = top-right, etc.
+    static constexpr int led_for_bank[6] = {0, 1, 2, 3, 4, 5};
 
     void update_controls()
     {
@@ -278,8 +267,12 @@ private:
         else if (sw == Switch::Middle)
         {
             // Page 2: SEED / SCAN / BASIS
-            seed_raw = knob_seed.update(KnobVal(Knob::Main));
-            seed_val = seed_raw; // seed updates directly
+            int32_t new_seed_raw = knob_seed.update(KnobVal(Knob::Main));
+            if (new_seed_raw != seed_raw) // only knob changes override Pulse2
+            {
+                seed_raw = new_seed_raw;
+                seed_val = seed_raw;
+            }
             scan_raw = knob_scan.update(KnobVal(Knob::X));
             basis_raw = knob_basis.update(KnobVal(Knob::Y));
         }

@@ -36,7 +36,7 @@ siren/
 ### Signal Flow
 
 ```
-[Audio In 2 (FM)] → frequency modulation ──┐
+[Audio In 2 (SPAN)] → SPAN modulation ──┐
 [Knobs/CV] → [Parameter Smoothing] → [Active Oscillator Bank (1 of 6)]
     → [Envelope] ──┐
                     ├── [Sum] → [Q15 to 12-bit] → [Audio Out L/R]
@@ -62,6 +62,28 @@ Each bank is a struct with a `process(const OscParams&, int16_t& out_l, int16_t&
 | 4 | BankWaveshape | 2 | FM-like tanh waveshaping |
 | 5 | BankWavetable | 4 | Waveform scanning with bit reduction |
 
+### Per-Bank Parameter Behavior
+
+**SINE** — Harmonic ratios [1, 1.5, 2, 3]. Phase feedback via WARP (scaled by `PHASE_FRAC_BITS` for proper accumulator range). SPAN scales each oscillator's deviation from fundamental (spreading, not shifting). MORPH weights per-oscillator amplitudes (fundamentals → upper harmonics) with gain normalization. SCAN adds inter-oscillator ring modulation.
+
+**CLST** — 4 tightly detuned oscillators. SPAN controls cluster width (unison → wide beating). WARP applies sub-oscillator amplitude modulation (`sub * p.warp >> 12`). MORPH applies per-oscillator frequency ratio offsets for different beating patterns. SCAN selects per-oscillator waveform (sine → tri → saw, offset per osc).
+
+**DTON** — Just intonation intervals. SPAN crossfades between tight intervals (1, 3rd, 5th, 7th) and wide intervals (2nd, 4th, 6th, octave). WARP applies wavefold with quadratic drive onset (`p.warp * p.warp >> 10`) for smooth low-end response. SCAN adds 2nd and 3rd harmonics (50%/25% max). MORPH scans carrier waveform (sine → triangle → sawtooth).
+
+**ANLG** — 2 oscillators with detuning. WARP crossfades smoothly between cross-modulation (CCW) and ring modulation (CW) with a 1500-2500 blend zone (no midpoint discontinuity). SPAN controls symmetric detuning. MORPH scans waveform (sine → tri → saw). SCAN scans modulator waveform.
+
+**WSHP** — Carrier + modulator in ~fifth relationship. WARP controls FM modulation index (0.5x → 6x). SPAN sets modulator frequency ratio (`*16` scaling for 1.5x-2.5x range). MORPH scans carrier waveform. SCAN controls wavefold intensity (continuous from 0, no dead zone). SEED applies asymmetric detuning via prime multipliers.
+
+**WAVE** — 4 oscillators with harmonic ratios [1, 2, 3, 5]. WARP splits into bit reduction (CCW, full 0-2047 range) and frequency cross-modulation (CW). SPAN scales detuning per harmonic number (`*(i+1)` so upper partials spread more). MORPH scans wavetable position (sine → tri → saw → pulse). SCAN offsets wavetable position per oscillator + pulse width. SEED uses per-oscillator prime multipliers `{0, 7, -5, 11}` for asymmetric detuning.
+
+### SEED Implementation
+
+All banks use asymmetric per-oscillator prime-number multipliers for SEED, creating non-uniform detuning that changes harmonic relationships without shifting the fundamental. Each bank has its own multiplier set (e.g., WAVE uses `{0, 7, -5, 11}`, keeping osc 0 anchored while others shift by different amounts and directions).
+
+### Knob Pickup
+
+When switching between Up and Middle switch positions, knobs use pickup behavior (like the Arturia MicroFreak). The `KnobPickup` struct holds the current parameter value and a `picked_up` flag. On page change, knobs are "released" — the parameter holds its value until the physical knob crosses within ~2% of it, preventing sudden jumps.
+
 ## Control Mapping
 
 ### Switch
@@ -77,7 +99,7 @@ Each bank is a struct with a `process(const OscParams&, int16_t& out_l, int16_t&
 
 ### Audio Input
 - Audio In 1 → processor input: waveshaped/folded by WARP+SCAN, dry/wet via MORPH, summed with drone (stereo from mono via offset processing)
-- Audio In 2 → FM input: modulates oscillator frequencies, depth scales with WARP
+- Audio In 2 → SPAN modulation: external CV/audio modulates detuning/spread
 
 ## Development
 
@@ -114,7 +136,7 @@ The oscillator algorithms in `oscillators.h` are integer-math ports of the Super
 
 ## Dependencies
 
-- [Raspberry Pi Pico SDK](https://github.com/raspberrypi/pico-sdk) (v2.1.1+)
+- [Raspberry Pi Pico SDK](https://github.com/raspberrypi/pico-sdk) (v2.2.0+)
 - [ComputerCard library](https://github.com/TomWhitwell/Workshop_Computer) (v0.2.7, included as header)
 
 ## References
