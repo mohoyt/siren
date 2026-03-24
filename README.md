@@ -98,6 +98,11 @@ Flash the resulting `siren.uf2` to the Workshop Computer by holding BOOT while c
 - Estimated CPU usage: ~20-40% of budget per sample at 48 kHz
 - No dynamic memory allocation
 
+## Videos
+
+- [Overview of oscillator banks](https://youtu.be/DORHEYpUqWU)
+- [Short jam](https://youtu.be/Lqdvu03-Lqs)
+
 ## Origins
 
 The oscillator algorithms are inspired by the Forge TME Vhikk X Eurorack module's SEED/SCAN paradigm of structural vs. timbral randomization.
