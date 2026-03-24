@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-**Siren** is a multi-algorithm drone oscillator for the Music Thing Modular Workshop System Computer (RP2040-based Eurorack module). It's a port of the oscillator core from [vhikk-drone](https://github.com/moseshoyt/vhikk-drone) (a monome norns script), adapted for the Workshop Computer's hardware constraints and modular synthesis context.
+**Siren** is a multi-algorithm drone oscillator for the Music Thing Modular Workshop System Computer (RP2040-based Eurorack module). It's loosely based on the oscillator cores from FORGE TME Vhikk X, adapted for the Workshop Computer's hardware constraints and modular synthesis context.
 
 ## Architecture
 
