@@ -17,6 +17,8 @@ Siren provides 6 switchable oscillator bank algorithms, each with a distinct tim
 
 ## Controls
 
+![Siren program card](tmp/Annotated_program_cards_siren.svg)
+
 ### Switch Positions
 
 | Position | Main Knob | X Knob | Y Knob |
@@ -25,7 +27,7 @@ Siren provides 6 switchable oscillator bank algorithms, each with a distinct tim
 | **Middle** | SEED (structural randomization) | SCAN (timbral morphing) | BASIS (root pitch) |
 | **Down** | *(momentary)* Tap to cycle through oscillator banks | | |
 
-The lit LED indicates which of the 6 banks is currently active.
+Banks crossfade smoothly over ~85ms when switching — both the old and new bank run simultaneously during the transition. The LEDs show the crossfade: the old bank dims while the new bank brightens.
 
 ### Parameters
 
@@ -69,7 +71,7 @@ When switching between Up and Middle switch positions, knobs use "pickup" behavi
 | **CV Out 1** | Pitch CV — mirrors current pitch (BASIS + CV1 modulation), centered around 0V |
 | **CV Out 2** | Envelope level — 0 when gated off, ramps up when open |
 | **Pulse In 1** | Gate — drone on/off |
-| **Pulse In 2** | Trigger — randomize SEED |
+| **Pulse In 2** | Dual-purpose: short pulse randomizes SEED, long hold (≥500ms) cycles bank with crossfade |
 | **Pulse Out 1** | Sub-oscillator clock — square wave at the fundamental frequency |
 | **Pulse Out 2** | 1/2 divider — square wave one octave below the fundamental |
 
@@ -93,7 +95,7 @@ Flash the resulting `siren.uf2` to the Workshop Computer by holding BOOT while c
 - All DSP uses fixed-point integer arithmetic (Q15 audio, Q16.16 phase accumulators)
 - Waveforms generated from 1024-point lookup tables with linear interpolation
 - Nonlinearities (tanh, wavefold) via lookup tables
-- Only the active oscillator bank computes each sample (no parallel bank overhead)
+- Only the active oscillator bank computes each sample (two banks run in parallel briefly during ~85ms crossfade transitions)
 - Knob pickup prevents parameter jumps when switching pages
 - Estimated CPU usage: ~20-40% of budget per sample at 48 kHz
 - No dynamic memory allocation

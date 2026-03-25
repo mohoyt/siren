@@ -14,7 +14,7 @@
 
 ### Design Decisions
 - **Fixed-point integer math throughout** — no floating point in the audio path
-- **One oscillator bank active at a time** — unlike the norns version which runs all 6 in parallel with SelectX crossfading
+- **One oscillator bank active at a time** (two during ~85ms crossfade transitions) — unlike the norns version which runs all 6 in parallel with SelectX crossfading
 - **No internal effects/LFOs** — the module lives in a modular system where external modules handle delays, reverbs, filters, and modulation
 - **Wavetable lookup** for all waveforms (sine, saw, triangle) with linear interpolation
 - **Lookup tables for nonlinearities** (tanh, wavefold) stored in flash
@@ -85,6 +85,10 @@ Each bank is a struct with a `process(const OscParams&, int16_t& out_l, int16_t&
 
 All banks use asymmetric per-oscillator prime-number multipliers for SEED, creating non-uniform detuning that changes harmonic relationships without shifting the fundamental. Each bank has its own multiplier set (e.g., WAVE uses `{0, 7, -5, 11}`, keeping osc 0 anchored while others shift by different amounts and directions).
 
+### Bank Crossfade
+
+When switching banks (via switch-down or Pulse In 2 long hold), both the old and new banks run simultaneously for 4096 samples (~85ms) with a linear crossfade. This uses power-of-2 length for division-free shift math. During crossfade, LEDs show both banks (old dimming, new brightening). If the gate is closed (env_level == 0), the swap is instant since there's no audio to crossfade. Additional bank cycle requests are ignored during an active crossfade.
+
 ### Knob Pickup
 
 When switching between Up and Middle switch positions, knobs use pickup behavior (like the Arturia MicroFreak). The `KnobPickup` struct holds the current parameter value and a `picked_up` flag. On page change, knobs are "released" — the parameter holds its value until the physical knob crosses within ~2% of it, preventing sudden jumps.
@@ -94,7 +98,7 @@ When switching between Up and Middle switch positions, knobs use pickup behavior
 ### Switch
 - **Up**: Knobs control WARP / SPAN / MORPH (Main / X / Y)
 - **Middle**: Knobs control SEED / SCAN / BASIS (Main / X / Y)
-- **Down (momentary)**: Cycle oscillator bank; LEDs show active bank
+- **Down (momentary)**: Cycle oscillator bank with ~85ms crossfade; LEDs show transition (old dims, new brightens)
 
 ### CV/Trigger
 - CV In 1 → pitch (added to BASIS)
@@ -102,7 +106,7 @@ When switching between Up and Middle switch positions, knobs use pickup behavior
 - CV Out 1 → pitch CV (mirrors BASIS + CV1 modulation)
 - CV Out 2 → envelope level
 - Pulse In 1 → gate on/off
-- Pulse In 2 → randomize SEED
+- Pulse In 2 → dual-purpose: short pulse randomizes SEED, long hold (≥500ms) cycles bank with crossfade
 - Pulse Out 1 → sub-oscillator clock (square wave at fundamental)
 - Pulse Out 2 → 1/2 divider (one octave below fundamental)
 
@@ -137,7 +141,7 @@ make
 
 ### Relationship to vhikk-drone
 The oscillator algorithms in `oscillators.h` are integer-math ports of the SuperCollider UGen chains in `vhikk-drone/lib/Engine_VhikkDrone.sc`. Key differences:
-- SC's `SelectX.ar` crossfading between all 6 banks → hard switch with envelope fade
+- SC's `SelectX.ar` crossfading between all 6 banks → sequential bank switching with ~85ms true crossfade (both banks run simultaneously during transition)
 - SC's `SinOsc.ar` → wavetable lookup with linear interpolation
 - SC's `.tanh` / `.fold2` → lookup table approximations
 - SC's `Lag.kr` → one-pole integer lowpass filter

@@ -14,7 +14,7 @@
 //   CV1: Pitch (added to BASIS)
 //   CV2: WARP modulation
 //   Pulse1: Gate (drone on/off)
-//   Pulse2: Randomize SEED on trigger
+//   Pulse2: Short pulse = randomize SEED, long hold (>=500ms) = cycle bank
 //
 //   Audio In 1/2: Ring-modulated with drone output
 //   Audio Out 1/2: Stereo drone output
@@ -152,14 +152,35 @@ public:
 
         if (env_level > 0)
         {
-            switch (current_bank)
+            if (next_bank != -1)
             {
-                case 0: bank_sine.process(params, out_l, out_r); break;
-                case 1: bank_cluster.process(params, out_l, out_r); break;
-                case 2: bank_diatonic.process(params, out_l, out_r); break;
-                case 3: bank_analogue.process(params, out_l, out_r); break;
-                case 4: bank_waveshape.process(params, out_l, out_r); break;
-                case 5: bank_wavetable.process(params, out_l, out_r); break;
+                // Crossfading: run both banks simultaneously
+                int16_t old_l = 0, old_r = 0;
+                int16_t new_l = 0, new_r = 0;
+                process_bank(current_bank, params, old_l, old_r);
+                process_bank(next_bank, params, new_l, new_r);
+
+                // Linear crossfade using power-of-2 length for shift math
+                // xfade_pos 0→4096, fade_new 0→32767
+                int16_t fade_new = (int16_t)(xfade_pos << 3); // 4096*8 = 32768 ≈ 32767
+                if (fade_new > 32767) fade_new = 32767;
+                int16_t fade_old = 32767 - fade_new;
+
+                out_l = (int16_t)(((int32_t)old_l * fade_old + (int32_t)new_l * fade_new) >> 15);
+                out_r = (int16_t)(((int32_t)old_r * fade_old + (int32_t)new_r * fade_new) >> 15);
+
+                xfade_pos++;
+                if (xfade_pos >= XFADE_LENGTH)
+                {
+                    current_bank = next_bank;
+                    next_bank = -1;
+                    xfade_pos = 0;
+                }
+            }
+            else
+            {
+                // Normal: single bank
+                process_bank(current_bank, params, out_l, out_r);
             }
 
             // Apply envelope
@@ -220,6 +241,17 @@ private:
 
     // Current bank selection (0-5)
     int current_bank = 0;
+
+    // Bank crossfade state
+    int next_bank = -1;              // -1 = no pending transition
+    int32_t xfade_pos = 0;          // 0 = fully old, XFADE_LENGTH = fully new
+    static constexpr int32_t XFADE_LENGTH = 4096; // ~85ms at 48kHz (power of 2 for shift math)
+
+    // Pulse In 2: dual-purpose timing (short = SEED, long hold = bank cycle)
+    bool pulse2_was_high = false;
+    uint32_t pulse2_high_counter = 0;
+    bool pulse2_bank_cycled = false;
+    static constexpr uint32_t PULSE2_LONG_THRESHOLD = 24000; // 500ms at 48kHz
 
     // Raw parameter values (0-4095)
     int32_t warp_raw, span_raw, morph_raw, seed_raw, scan_raw, basis_raw;
@@ -300,13 +332,13 @@ private:
             basis_raw = knob_basis.update(KnobVal(Knob::Y));
         }
 
-        // Switch down = momentary bank cycle
+        // Switch down = momentary bank cycle (with crossfade)
         if (sw == Switch::Down)
         {
             if (!switch_was_down)
             {
                 // Rising edge: cycle bank
-                current_bank = (current_bank + 1) % NUM_BANKS;
+                trigger_bank_cycle();
                 switch_was_down = true;
             }
         }
@@ -321,19 +353,65 @@ private:
             gate_open = PulseIn1();
         }
 
-        // Pulse2: randomize seed on rising edge
-        if (PulseIn2RisingEdge())
+        // Pulse2: dual-purpose (short pulse = SEED randomize, long hold = bank cycle)
+        if (PulseIn2())
         {
-            // Simple LCG for random seed
-            static uint32_t rng = 42;
-            rng = rng * 1664525 + 1013904223;
-            seed_val = (rng >> 20) & 4095;
+            if (!pulse2_was_high)
+            {
+                // Rising edge: randomize seed immediately (preserves trigger behavior)
+                static uint32_t rng = 42;
+                rng = rng * 1664525 + 1013904223;
+                seed_val = (rng >> 20) & 4095;
+                pulse2_high_counter = 0;
+                pulse2_bank_cycled = false;
+            }
+            pulse2_high_counter++;
+            if (pulse2_high_counter >= PULSE2_LONG_THRESHOLD && !pulse2_bank_cycled)
+            {
+                // Long hold: cycle bank with crossfade
+                trigger_bank_cycle();
+                pulse2_bank_cycled = true;
+            }
+            pulse2_was_high = true;
+        }
+        else
+        {
+            pulse2_was_high = false;
         }
     }
 
-    uint32_t get_phase0()
+    void trigger_bank_cycle()
     {
-        switch (current_bank)
+        if (next_bank != -1) return; // already crossfading
+        int target = (current_bank + 1) % NUM_BANKS;
+        if (env_level == 0)
+        {
+            // Silent: instant swap, no crossfade needed
+            current_bank = target;
+        }
+        else
+        {
+            next_bank = target;
+            xfade_pos = 0;
+        }
+    }
+
+    void process_bank(int bank_idx, const OscParams& params, int16_t& out_l, int16_t& out_r)
+    {
+        switch (bank_idx)
+        {
+            case 0: bank_sine.process(params, out_l, out_r); break;
+            case 1: bank_cluster.process(params, out_l, out_r); break;
+            case 2: bank_diatonic.process(params, out_l, out_r); break;
+            case 3: bank_analogue.process(params, out_l, out_r); break;
+            case 4: bank_waveshape.process(params, out_l, out_r); break;
+            case 5: bank_wavetable.process(params, out_l, out_r); break;
+        }
+    }
+
+    uint32_t get_bank_phase0(int bank_idx)
+    {
+        switch (bank_idx)
         {
             case 0: return bank_sine.phase[0];
             case 1: return bank_cluster.phase[0];
@@ -345,18 +423,44 @@ private:
         }
     }
 
+    uint32_t get_phase0()
+    {
+        // During crossfade, use dominant bank (old for first half, new for second)
+        if (next_bank != -1 && xfade_pos >= XFADE_LENGTH / 2)
+            return get_bank_phase0(next_bank);
+        return get_bank_phase0(current_bank);
+    }
+
     void update_leds()
     {
         led_counter++;
         if (led_counter < 480) return; // Update ~100 Hz
         led_counter = 0;
 
-        for (int i = 0; i < 6; i++)
+        if (next_bank != -1)
         {
-            if (i == current_bank)
-                LedBrightness(led_for_bank[i], 4095);
-            else
-                LedOff(led_for_bank[i]);
+            // During crossfade: old bank dims, new bank brightens
+            int32_t new_brightness = xfade_pos * 4095 >> 12; // 0→4095
+            int32_t old_brightness = 4095 - new_brightness;
+            for (int i = 0; i < 6; i++)
+            {
+                if (i == current_bank)
+                    LedBrightness(led_for_bank[i], old_brightness);
+                else if (i == next_bank)
+                    LedBrightness(led_for_bank[i], new_brightness);
+                else
+                    LedOff(led_for_bank[i]);
+            }
+        }
+        else
+        {
+            for (int i = 0; i < 6; i++)
+            {
+                if (i == current_bank)
+                    LedBrightness(led_for_bank[i], 4095);
+                else
+                    LedOff(led_for_bank[i]);
+            }
         }
     }
 
