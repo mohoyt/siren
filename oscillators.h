@@ -44,7 +44,7 @@ struct BankSine
         int32_t gains[4];
         gains[0] = 4095 - p.morph;                          // fundamental, fades out
         gains[1] = (p.morph < 2048) ? p.morph * 2 : (4095 - p.morph) * 2; // peaks mid
-        gains[2] = (p.morph > 1365) ? (p.morph - 1365) * 3 / 2 : 0;      // rises late
+        gains[2] = (p.morph > 1365) ? (p.morph - 1365) * 3 >> 1 : 0;      // rises late
         gains[3] = p.morph;                                  // harmonics, fades in
         // Normalize so total is roughly constant
         // Compute reciprocal with enough precision to avoid volume jumps
@@ -365,7 +365,7 @@ struct BankAnalogue
 
         // Stereo: slight delay approximation via phase offset
         int16_t delayed = table_lookup(sine_table, phase[0] - (p.span << 10));
-        int16_t right = q15_lerp(mixed, delayed, 1024 + p.span / 4);
+        int16_t right = q15_lerp(mixed, delayed, 1024 + (p.span >> 2));
 
         out_l = mixed;
         out_r = right;

@@ -1,3 +1,4 @@
+#include "pico/stdlib.h"
 #include "ComputerCard.h"
 #include "wavetables.h"
 #include "dsp.h"
@@ -534,6 +535,7 @@ private:
 
 int main()
 {
+    set_sys_clock_khz(144000, true);
     Siren siren;
     siren.EnableNormalisationProbe();
     siren.Run();
