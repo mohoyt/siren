@@ -17,7 +17,7 @@ Siren provides 6 switchable oscillator bank algorithms, each with a distinct tim
 
 ## Controls
 
-![Siren program card](tmp/Annotated_program_cards_siren.svg)
+![Siren program card](tmp/Annotated_program_cards_siren.png)
 
 ### Switch Positions
 
