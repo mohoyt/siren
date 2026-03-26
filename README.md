@@ -27,7 +27,7 @@ Siren provides 6 switchable oscillator bank algorithms, each with a distinct tim
 | **Middle** | SEED (structural randomization) | SCAN (timbral morphing) | BASIS (root pitch) |
 | **Down** | *(momentary)* Tap to cycle through oscillator banks | | |
 
-Banks crossfade over ~84ms when switching — the current bank fades out, switches at silence, then the new bank fades in. The LEDs show the transition: the old bank dims while the new bank brightens.
+Banks crossfade over 250ms when switching, using a sample buffer and equal-power curve for a smooth, gapless transition. The last 250ms of the old bank's audio is buffered and crossfaded against the new bank's output — no silence gap. The LEDs show the transition: the old bank dims while the new bank brightens.
 
 ### Parameters
 
@@ -95,7 +95,7 @@ Flash the resulting `siren.uf2` to the Workshop Computer by holding BOOT while c
 - All DSP uses fixed-point integer arithmetic (Q15 audio, Q16.16 phase accumulators)
 - Waveforms generated from 1024-point lookup tables with linear interpolation
 - Nonlinearities (tanh, wavefold) via lookup tables
-- Only one oscillator bank computes each sample (crossfade uses fade-out → switch → fade-in to stay within CPU budget)
+- Only one oscillator bank computes each sample (crossfade replays a 250ms sample buffer of the old bank against the new bank's live output, using an equal-power curve)
 - Knob pickup prevents parameter jumps when switching pages
 - Estimated CPU usage: ~20-40% of budget per sample at 48 kHz
 - No dynamic memory allocation

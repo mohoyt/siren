@@ -20,6 +20,12 @@
 //   Audio In 1/2: Ring-modulated with drone output
 //   Audio Out 1/2: Stereo drone output
 
+// Bank crossfade sample buffer (250ms at 48kHz = 12000 stereo samples)
+// File-scope to avoid putting 48KB on the stack
+static constexpr int XFADE_BUF_LEN = 12000;
+static int16_t xfade_buf_l[XFADE_BUF_LEN];
+static int16_t xfade_buf_r[XFADE_BUF_LEN];
+
 // Knob pickup: ignores the knob until it crosses near the current parameter
 // value, then tracks it. Prevents jumps when switching pages.
 struct KnobPickup
@@ -156,30 +162,37 @@ public:
             // Run only the current bank (never two at once — RP2040 can't handle it)
             process_bank(current_bank, params, out_l, out_r);
 
-            // Crossfade envelope: fade out old bank, switch, fade in new bank
-            if (xfade_fading_out)
+            // Apply main envelope
+            out_l = q15_mul(out_l, (int16_t)env_level);
+            out_r = q15_mul(out_r, (int16_t)env_level);
+
+            if (xfade_active)
             {
-                xfade_level -= XFADE_RATE;
-                if (xfade_level <= 0)
-                {
-                    // Reached silence: switch bank and start fading in
-                    xfade_level = 0;
-                    current_bank = pending_bank;
-                    pending_bank = -1;
-                    xfade_fading_out = false;
-                }
-            }
-            else if (xfade_level < 32767)
-            {
-                // Fading in new bank
-                xfade_level += XFADE_RATE;
-                if (xfade_level > 32767) xfade_level = 32767;
+                // Equal-power crossfade: blend buffered old bank output with new bank
+                // Read old bank audio from buffer (written before the switch)
+                int16_t buf_l = xfade_buf_l[xfade_buf_pos];
+                int16_t buf_r = xfade_buf_r[xfade_buf_pos];
+
+                int idx = xfade_phase >> 16;
+                if (idx > 255) idx = 255;
+                int16_t gain_in = xfade_curve[idx];
+                int16_t gain_out = xfade_curve[255 - idx];
+
+                out_l = q15_clip((int32_t)q15_mul(out_l, gain_in) + q15_mul(buf_l, gain_out));
+                out_r = q15_clip((int32_t)q15_mul(out_r, gain_in) + q15_mul(buf_r, gain_out));
+
+                xfade_phase += XFADE_PHASE_INC;
+                xfade_samples_left--;
+                if (xfade_samples_left <= 0) xfade_active = false;
             }
 
-            // Apply crossfade envelope on top of main envelope
-            int32_t combined_env = (int32_t)env_level * xfade_level >> 15;
-            out_l = q15_mul(out_l, (int16_t)combined_env);
-            out_r = q15_mul(out_r, (int16_t)combined_env);
+            // Always record output to crossfade buffer.
+            // During crossfade, read happens before write at the same position,
+            // so old data is consumed before being overwritten.
+            xfade_buf_l[xfade_buf_pos] = out_l;
+            xfade_buf_r[xfade_buf_pos] = out_r;
+            xfade_buf_pos++;
+            if (xfade_buf_pos >= XFADE_BUF_LEN) xfade_buf_pos = 0;
         }
 
         // ─── Audio In 1: Processor input ───
@@ -236,11 +249,15 @@ private:
     // Current bank selection (0-5)
     int current_bank = 0;
 
-    // Bank crossfade state (fade-out → switch → fade-in, never two banks at once)
-    int pending_bank = -1;           // -1 = no pending transition
-    int32_t xfade_level = 32767;    // Q15 crossfade envelope (32767 = full, 0 = silent)
-    bool xfade_fading_out = false;  // true = fading out old bank, false = fading in new
-    static constexpr int32_t XFADE_RATE = 16; // per-sample decrement/increment (~42ms each way)
+    // Buffer crossfade state: old bank's last 250ms is buffered, new bank crossfades in
+    int xfade_buf_pos = 0;              // circular buffer write/read position
+    bool xfade_active = false;          // true during crossfade
+    int32_t xfade_phase = 0;            // Q16 phase for equal-power curve lookup
+    int xfade_samples_left = 0;         // countdown during crossfade
+    int xfade_old_bank = 0;             // previous bank (for LED display during crossfade)
+    // Phase increment: traverse 256-entry table over 12000 samples
+    // (255 << 16) / 12000 ≈ 1393
+    static constexpr int32_t XFADE_PHASE_INC = 1393;
 
     // Pulse In 2: dual-purpose timing (short = SEED, long hold = bank cycle)
     bool pulse2_was_high = false;
@@ -377,7 +394,7 @@ private:
 
     void trigger_bank_cycle()
     {
-        if (pending_bank != -1 || xfade_fading_out || xfade_level < 32767) return; // already transitioning
+        if (xfade_active) return; // already transitioning
         int target = (current_bank + 1) % NUM_BANKS;
         if (env_level == 0)
         {
@@ -386,8 +403,13 @@ private:
         }
         else
         {
-            pending_bank = target;
-            xfade_fading_out = true;
+            // Buffer already contains the old bank's recent output.
+            // Switch bank immediately and crossfade buffer (old) → new bank.
+            xfade_old_bank = current_bank;
+            current_bank = target;
+            xfade_active = true;
+            xfade_phase = 0;
+            xfade_samples_left = XFADE_BUF_LEN;
         }
     }
 
@@ -429,28 +451,19 @@ private:
         if (led_counter < 480) return; // Update ~100 Hz
         led_counter = 0;
 
-        if (xfade_fading_out && pending_bank != -1)
+        if (xfade_active)
         {
-            // Fading out: old bank dims, new bank shown dim
-            int32_t brightness = xfade_level * 4095 >> 15;
+            // Crossfading: old bank dims, new bank brightens (equal-power curve)
+            int idx = xfade_phase >> 16;
+            if (idx > 255) idx = 255;
+            int32_t new_brightness = (int32_t)xfade_curve[idx] * 4095 >> 15;
+            int32_t old_brightness = (int32_t)xfade_curve[255 - idx] * 4095 >> 15;
             for (int i = 0; i < 6; i++)
             {
                 if (i == current_bank)
-                    LedBrightness(led_for_bank[i], brightness);
-                else if (i == pending_bank)
-                    LedBrightness(led_for_bank[i], 4095 - brightness);
-                else
-                    LedOff(led_for_bank[i]);
-            }
-        }
-        else if (xfade_level < 32767)
-        {
-            // Fading in: new bank brightens
-            int32_t brightness = xfade_level * 4095 >> 15;
-            for (int i = 0; i < 6; i++)
-            {
-                if (i == current_bank)
-                    LedBrightness(led_for_bank[i], brightness);
+                    LedBrightness(led_for_bank[i], new_brightness);
+                else if (i == xfade_old_bank)
+                    LedBrightness(led_for_bank[i], old_brightness);
                 else
                     LedOff(led_for_bank[i]);
             }

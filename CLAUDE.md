@@ -89,7 +89,7 @@ All banks use asymmetric per-oscillator prime-number multipliers for SEED, creat
 
 ### Bank Crossfade
 
-When switching banks (via switch-down or Pulse In 2 long hold), the current bank fades out, the bank switches at silence, and the new bank fades in (~42ms each way, ~84ms total). Only one bank ever runs at a time — the RP2040 can't handle two banks simultaneously without overrunning the sample callback. During crossfade, LEDs show the transition (old dims, new brightens). If the gate is closed (env_level == 0), the swap is instant since there's no audio to crossfade. Additional bank cycle requests are ignored during an active crossfade.
+When switching banks (via switch-down or Pulse In 2 long hold), the module performs a 250ms equal-power crossfade using a sample buffer. A circular buffer continuously records the last 250ms (12,000 samples) of stereo output. On bank switch, the new bank starts immediately and its output is crossfaded against the buffered old bank audio using a sin/cos equal-power curve (256-entry lookup table). Only one bank ever runs at a time — the buffer replay is just reads + multiplies, trivially cheap compared to running a second oscillator bank. During crossfade, LEDs show the transition (old dims, new brightens) following the same equal-power curve. If the gate is closed (env_level == 0), the swap is instant since there's no audio to crossfade. Additional bank cycle requests are ignored during an active crossfade. The buffer uses ~48KB of RAM (file-scope static to avoid stack overflow).
 
 ### Knob Pickup
 
@@ -143,7 +143,7 @@ make
 
 ### Relationship to vhikk-drone
 The oscillator algorithms in `oscillators.h` are integer-math ports of the SuperCollider UGen chains in `vhikk-drone/lib/Engine_VhikkDrone.sc`. Key differences:
-- SC's `SelectX.ar` crossfading between all 6 banks → sequential bank switching with ~84ms fade-out/fade-in crossfade (only one bank runs at a time)
+- SC's `SelectX.ar` crossfading between all 6 banks → sequential bank switching with 250ms equal-power crossfade using sample buffer (only one bank runs at a time)
 - SC's `SinOsc.ar` → wavetable lookup with linear interpolation
 - SC's `.tanh` / `.fold2` → lookup table approximations
 - SC's `Lag.kr` → one-pole integer lowpass filter

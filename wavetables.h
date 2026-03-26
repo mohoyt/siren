@@ -27,6 +27,11 @@ static int16_t tanh_table[TABLE_SIZE];
 // Wavefold table: maps -2.0..+2.0 to folded output
 static int16_t fold_table[TABLE_SIZE];
 
+// Equal-power crossfade curve: sin(x * pi/2) scaled to Q15
+// Used for smooth bank transitions without volume dip
+static constexpr int XFADE_TABLE_SIZE = 256;
+static int16_t xfade_curve[XFADE_TABLE_SIZE];
+
 // Initialize all wavetables (call once at startup)
 inline void init_wavetables()
 {
@@ -94,6 +99,25 @@ inline void init_wavetables()
         while (x > 1.0) x = 2.0 - x;
         while (x < -1.0) x = -2.0 - x;
         fold_table[i] = (int16_t)(x * 32767.0);
+    }
+
+    // Equal-power crossfade: sin(x * pi/2) for x in [0, 1]
+    // fade_in uses xfade_curve[i], fade_out uses xfade_curve[255 - i]
+    for (int i = 0; i < XFADE_TABLE_SIZE; i++)
+    {
+        double x = (double)i / (XFADE_TABLE_SIZE - 1) * 3.14159265358979 / 2.0;
+        // Taylor series for sin(x), x in [0, pi/2] — converges quickly
+        double term = x;
+        double s = term;
+        term *= -x * x / (2.0 * 3.0);
+        s += term;
+        term *= -x * x / (4.0 * 5.0);
+        s += term;
+        term *= -x * x / (6.0 * 7.0);
+        s += term;
+        term *= -x * x / (8.0 * 9.0);
+        s += term;
+        xfade_curve[i] = (int16_t)(s * 32767.0);
     }
 }
 
