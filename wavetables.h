@@ -26,15 +26,16 @@ static int16_t saw_table[TABLE_SIZE];
 // ── Band-limited (mipmapped) saw/triangle tables ──────────────────────────
 // The raw saw ramp above contains full-spectrum harmonics that fold
 // (alias) at every pitch. These mip sets are band-limited per octave: each
-// (alias) at every pitch. These mip sets are band-limited per octave: each
 // level keeps only the harmonics that stay below Nyquist for that octave band,
 // built by integer additive synthesis from sine_table (no floats, fast boot).
 // At runtime we pick a level from the oscillator's phase increment.
 //
 // Level 0 is the lowest octave (most harmonics); each higher level halves the
-// harmonic count for the next octave up. NUM_MIPS=8 covers Siren's oscillator
-// range (~27 Hz fundamentals up to ~5.5 kHz partials, fundamental × ratio ≤ 5).
-static constexpr int NUM_MIPS = 8;
+// harmonic count for the next octave up. NUM_MIPS=10 runs the schedule all the
+// way down to a single harmonic so even CV-extended pitches stay alias-free:
+// the WAVE bank's ~5x ratio on a ~3.5 kHz CV root reaches ~17.6 kHz, which lands
+// on the top level (Hmax=1, pure fundamental) instead of folding harmonics back.
+static constexpr int NUM_MIPS = 10;
 static int16_t saw_mips[NUM_MIPS][TABLE_SIZE];
 static int16_t tri_mips[NUM_MIPS][TABLE_SIZE];
 
@@ -42,7 +43,7 @@ static int16_t tri_mips[NUM_MIPS][TABLE_SIZE];
 // Clamped to >= 1 so the top level is at least a sine.
 inline int mip_harmonic_limit(int level)
 {
-    int h = 512 >> level; // 512, 256, 128, 64, 32, 16, 8, 4
+    int h = 512 >> level; // 512, 256, 128, 64, 32, 16, 8, 4, 2, 1
     return h < 1 ? 1 : h;
 }
 
@@ -223,7 +224,7 @@ inline int16_t table_lookup(const int16_t* table, uint32_t phase)
 // Select a band-limited mip level from an oscillator's phase increment.
 // phase_inc is proportional to frequency; the boundary between octave bands sits
 // almost exactly at powers of two of inc (since 24000/512 * 1024*2^22/48000 ≈ 2^22).
-//   level 0: freq < ~47 Hz ... level 7: up to ~6 kHz (Hmax=4). Above that we clamp.
+//   level 0: freq < ~47 Hz ... level 9 (Hmax=1) covers ~12-24 kHz; above we clamp.
 inline int mip_for_inc(uint32_t phase_inc)
 {
     if (phase_inc == 0) return 0;
