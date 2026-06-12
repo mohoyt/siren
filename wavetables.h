@@ -18,8 +18,34 @@ static constexpr int32_t PHASE_FRAC_MASK = (1 << PHASE_FRAC_BITS) - 1;
 // Using a simple approximation since constexpr trig isn't available everywhere
 // We'll compute it with a runtime init instead
 static int16_t sine_table[TABLE_SIZE];
+// Raw geometric ramp. Only used now where a clean monotonic ramp is wanted (the
+// WAVE bank's PWM pulse threshold); all tonal saw/tri reads go through the
+// band-limited mips below.
 static int16_t saw_table[TABLE_SIZE];
-static int16_t tri_table[TABLE_SIZE];
+
+// ── Band-limited (mipmapped) saw/triangle tables ──────────────────────────
+// The raw saw ramp above contains full-spectrum harmonics that fold
+// (alias) at every pitch. These mip sets are band-limited per octave: each
+// level keeps only the harmonics that stay below Nyquist for that octave band,
+// built by integer additive synthesis from sine_table (no floats, fast boot).
+// At runtime we pick a level from the oscillator's phase increment.
+//
+// Level 0 is the lowest octave (most harmonics); each higher level halves the
+// harmonic count for the next octave up. NUM_MIPS=10 runs the schedule all the
+// way down to a single harmonic so even CV-extended pitches stay alias-free:
+// the WAVE bank's ~5x ratio on a ~3.5 kHz CV root reaches ~17.6 kHz, which lands
+// on the top level (Hmax=1, pure fundamental) instead of folding harmonics back.
+static constexpr int NUM_MIPS = 10;
+static int16_t saw_mips[NUM_MIPS][TABLE_SIZE];
+static int16_t tri_mips[NUM_MIPS][TABLE_SIZE];
+
+// Max harmonic kept at level L. Level 0 holds the most; halves each octave.
+// Clamped to >= 1 so the top level is at least a sine.
+inline int mip_harmonic_limit(int level)
+{
+    int h = 512 >> level; // 512, 256, 128, 64, 32, 16, 8, 4, 2, 1
+    return h < 1 ? 1 : h;
+}
 
 // Tanh approximation table for waveshaping (input range -4.0 to +4.0 mapped to 0..1023)
 static int16_t tanh_table[TABLE_SIZE];
@@ -65,19 +91,82 @@ inline void init_wavetables()
         sine_table[i] = (int16_t)val;
     }
 
-    // Saw: ramp from -32767 to +32767
+    // Saw: ramp from -32767 to +32767 (clean monotonic ramp; see declaration)
     for (int i = 0; i < TABLE_SIZE; i++)
     {
         saw_table[i] = (int16_t)((int32_t)i * 65534 / TABLE_SIZE - 32767);
     }
 
-    // Triangle
-    for (int i = 0; i < TABLE_SIZE; i++)
+    // Band-limited saw/triangle mips via integer additive synthesis from
+    // sine_table. Phases match the geometric saw ramp (and a triangle with its
+    // minimum at phase 0) so the waveform morphs in oscillators.h blend cleanly:
+    //   saw  f(x) = x/pi - 1        = -(2/pi)  * sum_{h>=1}      sin(h x) / h
+    //   tri  T(x) (min at 0, +peak at pi) = -(8/pi^2) * sum_{h odd} cos(h x) / h^2
+    // cos(h x) is read from sine_table a quarter period ahead: index + TABLE_SIZE/4.
+    // Each level is normalized to full Q15, so the leading constants drop out; only
+    // the relative harmonic weighting and sign (polarity) matter.
     {
-        if (i < TABLE_SIZE / 2)
-            tri_table[i] = (int16_t)((int32_t)i * 65534 / (TABLE_SIZE / 2) - 32767);
-        else
-            tri_table[i] = (int16_t)(32767 - (int32_t)(i - TABLE_SIZE / 2) * 65534 / (TABLE_SIZE / 2));
+        static int32_t acc[TABLE_SIZE]; // static: keep off the stack
+        for (int level = 0; level < NUM_MIPS; level++)
+        {
+            int Hmax = mip_harmonic_limit(level);
+
+            // ---- Saw: all harmonics, weight 1/h, negative sign for polarity ----
+            for (int i = 0; i < TABLE_SIZE; i++) acc[i] = 0;
+            for (int h = 1; h <= Hmax; h++)
+            {
+                int32_t w = 16384 / h; // 1/h weight, Q14-ish
+                for (int i = 0; i < TABLE_SIZE; i++)
+                {
+                    int idx = (i * h) & TABLE_MASK;
+                    acc[i] -= (int32_t)sine_table[idx] * w >> 7;
+                }
+            }
+            // Normalize to full Q15 preserving sign
+            {
+                int32_t peak = 1;
+                for (int i = 0; i < TABLE_SIZE; i++)
+                {
+                    int32_t a = acc[i] < 0 ? -acc[i] : acc[i];
+                    if (a > peak) peak = a;
+                }
+                for (int i = 0; i < TABLE_SIZE; i++)
+                {
+                    int32_t v = (int32_t)((int64_t)acc[i] * 32767 / peak);
+                    if (v > 32767) v = 32767;
+                    if (v < -32768) v = -32768;
+                    saw_mips[level][i] = (int16_t)v;
+                }
+            }
+
+            // ---- Triangle: odd harmonics, weight 1/h^2, cosine phase ----
+            for (int i = 0; i < TABLE_SIZE; i++) acc[i] = 0;
+            for (int h = 1; h <= Hmax; h += 2)
+            {
+                int32_t w = 16384 / (h * h); // 1/h^2 weight
+                if (w == 0) break;           // remaining harmonics negligible
+                for (int i = 0; i < TABLE_SIZE; i++)
+                {
+                    int idx = (i * h + TABLE_SIZE / 4) & TABLE_MASK; // cos
+                    acc[i] -= (int32_t)sine_table[idx] * w >> 7;
+                }
+            }
+            {
+                int32_t peak = 1;
+                for (int i = 0; i < TABLE_SIZE; i++)
+                {
+                    int32_t a = acc[i] < 0 ? -acc[i] : acc[i];
+                    if (a > peak) peak = a;
+                }
+                for (int i = 0; i < TABLE_SIZE; i++)
+                {
+                    int32_t v = (int32_t)((int64_t)acc[i] * 32767 / peak);
+                    if (v > 32767) v = 32767;
+                    if (v < -32768) v = -32768;
+                    tri_mips[level][i] = (int16_t)v;
+                }
+            }
+        }
     }
 
     // Tanh table: input mapped from -4.0 to +4.0
@@ -130,6 +219,26 @@ inline int16_t table_lookup(const int16_t* table, uint32_t phase)
     int32_t a = table[idx];
     int32_t b = table[(idx + 1) & TABLE_MASK];
     return (int16_t)(a + ((b - a) * (int32_t)frac >> 15));
+}
+
+// Select a band-limited mip level from an oscillator's phase increment.
+// phase_inc is proportional to frequency; the boundary between octave bands sits
+// almost exactly at powers of two of inc (since 24000/512 * 1024*2^22/48000 ≈ 2^22).
+//   level 0: freq < ~47 Hz ... level 9 (Hmax=1) covers ~12-24 kHz; above we clamp.
+inline int mip_for_inc(uint32_t phase_inc)
+{
+    if (phase_inc == 0) return 0;
+    int msb = 31 - __builtin_clz(phase_inc);
+    int level = msb - 21;
+    if (level < 0) level = 0;
+    if (level >= NUM_MIPS) level = NUM_MIPS - 1;
+    return level;
+}
+
+// Band-limited lookup: same linear interpolation as table_lookup, on a chosen mip.
+inline int16_t bl_lookup(const int16_t (*mips)[TABLE_SIZE], uint32_t phase, int mip)
+{
+    return table_lookup(mips[mip], phase);
 }
 
 // Convert frequency (Hz) to phase increment for 48kHz sample rate
