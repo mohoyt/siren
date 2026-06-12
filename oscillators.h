@@ -144,6 +144,7 @@ struct BankCluster
             inc = (uint32_t)((int64_t)inc * morph_ratio >> 16);
 
             phase[i] += inc;
+            int mip = mip_for_inc(inc); // band-limited level for this osc's pitch
 
             // Waveform selection based on SCAN (circular: sine → tri → saw → sine)
             int16_t wave;
@@ -152,18 +153,18 @@ struct BankCluster
             {
                 int32_t blend = scan_pos * 3;
                 wave = q15_lerp(table_lookup(sine_table, phase[i]),
-                               table_lookup(tri_table, phase[i]), blend);
+                               bl_lookup(tri_mips, phase[i], mip), blend);
             }
             else if (scan_pos < 2730)
             {
                 int32_t blend = (scan_pos - 1365) * 3;
-                wave = q15_lerp(table_lookup(tri_table, phase[i]),
-                               table_lookup(saw_table, phase[i]), blend);
+                wave = q15_lerp(bl_lookup(tri_mips, phase[i], mip),
+                               bl_lookup(saw_mips, phase[i], mip), blend);
             }
             else
             {
                 int32_t blend = (scan_pos - 2730) * 3;
-                wave = q15_lerp(table_lookup(saw_table, phase[i]),
+                wave = q15_lerp(bl_lookup(saw_mips, phase[i], mip),
                                table_lookup(sine_table, phase[i]), blend);
             }
 
@@ -196,6 +197,7 @@ struct BankCluster
 struct BankDiatonic
 {
     uint32_t phase[4] = {};
+    Halfband2x decim_l, decim_r; // 2x oversampling decimators
 
     // Two sets of interval ratios in Q16.16
     // Set 0 (tight): unison, major 3rd, 5th, major 7th
@@ -205,11 +207,12 @@ struct BankDiatonic
 
     void process(const OscParams& p, int16_t& out_l, int16_t& out_r)
     {
-        int32_t mix_l = 0, mix_r = 0;
-
         // SPAN crossfades between tight and wide interval sets
         int32_t span_blend = p.span;
 
+        // Precompute per-oscillator increments, half-steps and band-limited levels
+        uint32_t inc[4], hinc[4];
+        int mip[4];
         for (int i = 0; i < 4; i++)
         {
             // Blend between interval sets based on span
@@ -221,52 +224,67 @@ struct BankDiatonic
             static constexpr int32_t dton_seed_scale[4] = {0, 3, -2, 5};
             ratio += (int32_t)p.seed * dton_seed_scale[i];
 
-            uint32_t inc = (uint32_t)((int64_t)p.basis_freq * ratio >> 16);
-            phase[i] += inc;
-
-            // MORPH: waveform scan (sine -> tri -> saw)
-            int16_t wave;
-            if (p.morph < 2048)
-            {
-                int32_t blend = p.morph * 2;
-                wave = q15_lerp(table_lookup(sine_table, phase[i]),
-                               table_lookup(tri_table, phase[i]), blend);
-            }
-            else
-            {
-                int32_t blend = (p.morph - 2048) * 2;
-                wave = q15_lerp(table_lookup(tri_table, phase[i]),
-                               table_lookup(saw_table, phase[i]), blend);
-            }
-
-            // WARP: wavefold intensity (gradual onset)
-            // Smoothly scales from 1.0x to 4.0x drive, then folds
-            {
-                int32_t drive = 4096 + ((int32_t)p.warp * p.warp >> 10); // quadratic for smooth onset
-                int32_t scaled = (int32_t)wave * drive >> 12;
-                int32_t fold_idx = (scaled >> 6) + 512;
-                if (fold_idx < 0) fold_idx = 0;
-                if (fold_idx > 1023) fold_idx = 1023;
-                wave = fold_table[fold_idx];
-            }
-
-            // SCAN: add 2nd harmonic for richer timbre
-            {
-                uint32_t h2_phase = phase[i] << 1;
-                int16_t h2 = table_lookup(sine_table, h2_phase);
-                // scan 0-4095: h2 up to 75% mix
-                int32_t h2_amt = (int32_t)h2 * p.scan >> 12;
-                wave = q15_clip((int32_t)wave + h2_amt);
-            }
-
-            // Pan across stereo (oscillators spread L to R)
-            int32_t pan = i * 1365;
-            mix_l += ((int32_t)wave * (4095 - pan)) >> 14;
-            mix_r += ((int32_t)wave * pan) >> 14;
+            inc[i] = (uint32_t)((int64_t)p.basis_freq * ratio >> 16);
+            hinc[i] = inc[i] >> 1;
+            mip[i] = mip_for_inc(inc[i]);
         }
 
-        out_l = q15_clip(mix_l);
-        out_r = q15_clip(mix_r);
+        // WARP wavefold drive depends only on params — hoist out of the loops
+        int32_t drive = 4096 + ((int32_t)p.warp * p.warp >> 10); // quadratic onset
+
+        // Run the wavefold + 2nd-harmonic stage at 2x rate, then decimate.
+        int16_t sub_l[2], sub_r[2];
+        for (int s = 0; s < 2; s++)
+        {
+            int32_t mix_l = 0, mix_r = 0;
+            for (int i = 0; i < 4; i++)
+            {
+                phase[i] += (s == 0) ? hinc[i] : (inc[i] - hinc[i]);
+
+                // MORPH: waveform scan (sine -> tri -> saw), band-limited
+                int16_t wave;
+                if (p.morph < 2048)
+                {
+                    int32_t blend = p.morph * 2;
+                    wave = q15_lerp(table_lookup(sine_table, phase[i]),
+                                   bl_lookup(tri_mips, phase[i], mip[i]), blend);
+                }
+                else
+                {
+                    int32_t blend = (p.morph - 2048) * 2;
+                    wave = q15_lerp(bl_lookup(tri_mips, phase[i], mip[i]),
+                                   bl_lookup(saw_mips, phase[i], mip[i]), blend);
+                }
+
+                // WARP: wavefold intensity (gradual onset)
+                {
+                    int32_t scaled = (int32_t)wave * drive >> 12;
+                    int32_t fold_idx = (scaled >> 6) + 512;
+                    if (fold_idx < 0) fold_idx = 0;
+                    if (fold_idx > 1023) fold_idx = 1023;
+                    wave = fold_table[fold_idx];
+                }
+
+                // SCAN: add 2nd harmonic for richer timbre
+                {
+                    uint32_t h2_phase = phase[i] << 1;
+                    int16_t h2 = table_lookup(sine_table, h2_phase);
+                    // scan 0-4095: h2 up to 75% mix
+                    int32_t h2_amt = (int32_t)h2 * p.scan >> 12;
+                    wave = q15_clip((int32_t)wave + h2_amt);
+                }
+
+                // Pan across stereo (oscillators spread L to R)
+                int32_t pan = i * 1365;
+                mix_l += ((int32_t)wave * (4095 - pan)) >> 14;
+                mix_r += ((int32_t)wave * pan) >> 14;
+            }
+            sub_l[s] = q15_clip(mix_l);
+            sub_r[s] = q15_clip(mix_r);
+        }
+
+        out_l = decim_l.process(sub_l[0], sub_l[1]);
+        out_r = decim_r.process(sub_r[0], sub_r[1]);
     }
 };
 
@@ -292,19 +310,21 @@ struct BankAnalogue
         uint32_t inc2 = (uint32_t)((int64_t)p.basis_freq * ratio2 >> 16);
         phase[0] += inc1;
         phase[1] += inc2;
+        int mip0 = mip_for_inc(inc1); // band-limited levels per oscillator
+        int mip1 = mip_for_inc(inc2);
 
         // MORPH: carrier waveform scan (sine -> tri -> saw)
         int16_t carrier;
         if (p.morph < 2048)
         {
             carrier = q15_lerp(table_lookup(sine_table, phase[0]),
-                              table_lookup(tri_table, phase[0]),
+                              bl_lookup(tri_mips, phase[0], mip0),
                               p.morph * 2);
         }
         else
         {
-            carrier = q15_lerp(table_lookup(tri_table, phase[0]),
-                              table_lookup(saw_table, phase[0]),
+            carrier = q15_lerp(bl_lookup(tri_mips, phase[0], mip0),
+                              bl_lookup(saw_mips, phase[0], mip0),
                               (p.morph - 2048) * 2);
         }
 
@@ -313,13 +333,13 @@ struct BankAnalogue
         if (p.scan < 2048)
         {
             modulator = q15_lerp(table_lookup(sine_table, phase[1]),
-                                table_lookup(tri_table, phase[1]),
+                                bl_lookup(tri_mips, phase[1], mip1),
                                 p.scan * 2);
         }
         else
         {
-            modulator = q15_lerp(table_lookup(tri_table, phase[1]),
-                                table_lookup(saw_table, phase[1]),
+            modulator = q15_lerp(bl_lookup(tri_mips, phase[1], mip1),
+                                bl_lookup(saw_mips, phase[1], mip1),
                                 (p.scan - 2048) * 2);
         }
 
@@ -379,6 +399,7 @@ struct BankAnalogue
 struct BankWaveshape
 {
     uint32_t phase[2] = {};
+    Halfband2x decim; // 2x oversampling decimator (mono; right = -left)
 
     void process(const OscParams& p, int16_t& out_l, int16_t& out_r)
     {
@@ -389,60 +410,74 @@ struct BankWaveshape
 
         uint32_t inc1 = p.basis_freq;
         uint32_t inc2 = (uint32_t)((int64_t)p.basis_freq * ratio2 >> 16);
-        phase[0] += inc1;
-        phase[1] += inc2;
-
-        // MORPH: carrier waveform (sine -> tri -> saw)
-        int16_t carrier;
-        if (p.morph < 2048)
-        {
-            carrier = q15_lerp(table_lookup(sine_table, phase[0]),
-                              table_lookup(tri_table, phase[0]),
-                              p.morph * 2);
-        }
-        else
-        {
-            carrier = q15_lerp(table_lookup(tri_table, phase[0]),
-                              table_lookup(saw_table, phase[0]),
-                              (p.morph - 2048) * 2);
-        }
-
-        int16_t modulator = table_lookup(sine_table, phase[1]);
+        uint32_t h1 = inc1 >> 1; // half-steps for 2x oversampling
+        uint32_t h2 = inc2 >> 1;
+        int mip = mip_for_inc(inc1); // carrier band-limited level
 
         // WARP controls modulation index (0.5 to 6.0)
         // At warp=0: index=0.5 (subtle), warp=4095: index=6.0 (extreme)
         int32_t mod_index = 2048 + p.warp * 5; // approximate 0.5-6.0 in Q12
 
-        // Apply FM-like waveshaping: carrier * index * (1 + mod * 0.5)
-        int32_t shaped = (int32_t)carrier * mod_index >> 12;
-        shaped += (int32_t)((int64_t)shaped * modulator >> 16);
-
-        // Tanh waveshaping: map to table index
-        // Input is roughly -4.0 to +4.0, table is 1024 entries
-        int32_t tanh_idx = (shaped >> 7) + 512;
-        if (tanh_idx < 0) tanh_idx = 0;
-        if (tanh_idx > 1023) tanh_idx = 1023;
-        int16_t result = tanh_table[tanh_idx];
-
-        // SCAN: fold intensity (continuous from 0)
+        // Run the FM -> tanh -> fold cascade at 2x rate (96 kHz internal) to push
+        // the aliasing byproducts above 24 kHz before decimating back to 48 kHz.
+        int16_t sub_out[2];
+        for (int s = 0; s < 2; s++)
         {
-            int32_t fold_input = (int32_t)result * (4096 + p.scan * 2) >> 12;
-            int32_t fold_idx = (fold_input >> 6) + 512;
-            if (fold_idx < 0) fold_idx = 0;
-            if (fold_idx > 1023) fold_idx = 1023;
-            result = fold_table[fold_idx];
+            // Advance by half a step each sub-sample; exact total = inc per sample
+            phase[0] += (s == 0) ? h1 : (inc1 - h1);
+            phase[1] += (s == 0) ? h2 : (inc2 - h2);
+
+            // MORPH: carrier waveform (sine -> tri -> saw), band-limited
+            int16_t carrier;
+            if (p.morph < 2048)
+            {
+                carrier = q15_lerp(table_lookup(sine_table, phase[0]),
+                                  bl_lookup(tri_mips, phase[0], mip),
+                                  p.morph * 2);
+            }
+            else
+            {
+                carrier = q15_lerp(bl_lookup(tri_mips, phase[0], mip),
+                                  bl_lookup(saw_mips, phase[0], mip),
+                                  (p.morph - 2048) * 2);
+            }
+
+            int16_t modulator = table_lookup(sine_table, phase[1]);
+
+            // Apply FM-like waveshaping: carrier * index * (1 + mod * 0.5)
+            int32_t shaped = (int32_t)carrier * mod_index >> 12;
+            shaped += (int32_t)((int64_t)shaped * modulator >> 16);
+
+            // Tanh waveshaping: map to table index
+            // Input is roughly -4.0 to +4.0, table is 1024 entries
+            int32_t tanh_idx = (shaped >> 7) + 512;
+            if (tanh_idx < 0) tanh_idx = 0;
+            if (tanh_idx > 1023) tanh_idx = 1023;
+            int16_t result = tanh_table[tanh_idx];
+
+            // SCAN: fold intensity (continuous from 0)
+            {
+                int32_t fold_input = (int32_t)result * (4096 + p.scan * 2) >> 12;
+                int32_t fold_idx = (fold_input >> 6) + 512;
+                if (fold_idx < 0) fold_idx = 0;
+                if (fold_idx > 1023) fold_idx = 1023;
+                result = fold_table[fold_idx];
+            }
+
+            // Seed: add 2nd harmonic (continuous from 0)
+            {
+                uint32_t h2_phase = phase[0] << 1;
+                int16_t h2s = table_lookup(sine_table, h2_phase);
+                result = q15_clip((int32_t)result + ((int32_t)h2s * p.seed >> 14));
+            }
+
+            sub_out[s] = result;
         }
 
-        // Seed: add 2nd harmonic (continuous from 0)
-        {
-            uint32_t h2_phase = phase[0] << 1;
-            int16_t h2 = table_lookup(sine_table, h2_phase);
-            result = q15_clip((int32_t)result + ((int32_t)h2 * p.seed >> 14));
-        }
-
-        // Phase-inverted stereo (like SC version)
-        out_l = result;
-        out_r = (int16_t)-(int32_t)result;
+        // Decimate 96 kHz -> 48 kHz, then phase-inverted stereo (like SC version)
+        int16_t mono = decim.process(sub_out[0], sub_out[1]);
+        out_l = mono;
+        out_r = (int16_t)-(int32_t)mono;
     }
 };
 
@@ -453,14 +488,16 @@ struct BankWaveshape
 struct BankWavetable
 {
     uint32_t phase[4] = {};
+    Halfband2x decim_l, decim_r; // 2x oversampling decimators
 
     // Harmonic ratios [1, 2, 3, 5] in Q16.16
     static constexpr int32_t ratios[4] = {65536, 131072, 196608, 327680};
 
     void process(const OscParams& p, int16_t& out_l, int16_t& out_r)
     {
-        int32_t mix_l = 0, mix_r = 0;
-
+        // Precompute per-oscillator increments, half-steps and band-limited levels
+        uint32_t inc[4], hinc[4];
+        int mip[4];
         for (int i = 0; i < 4; i++)
         {
             // Frequency with span-based detuning and seed variation
@@ -472,75 +509,91 @@ struct BankWavetable
             int32_t seed_offset = (int32_t)p.seed * seed_scale[i];
             int32_t ratio = ratios[i] + detune + seed_offset;
 
-            uint32_t inc = (uint32_t)((int64_t)p.basis_freq * ratio >> 16);
-            phase[i] += inc;
-
-            // Wavetable position: MORPH + per-osc offset from SCAN
-            int32_t table_pos = p.morph + ((int32_t)p.scan * (i + 1) * 307 >> 12);
-            table_pos &= 4095; // wrap
-
-            // Blend between waveforms based on position (circular: sine→tri→saw→pulse→sine)
-            int16_t wave;
-            if (table_pos < 1024)
-            {
-                wave = q15_lerp(table_lookup(sine_table, phase[i]),
-                               table_lookup(tri_table, phase[i]),
-                               table_pos * 4);
-            }
-            else if (table_pos < 2048)
-            {
-                wave = q15_lerp(table_lookup(tri_table, phase[i]),
-                               table_lookup(saw_table, phase[i]),
-                               (table_pos - 1024) * 4);
-            }
-            else if (table_pos < 3072)
-            {
-                // Approximate pulse/square by thresholding saw
-                int16_t saw_val = table_lookup(saw_table, phase[i]);
-                int32_t threshold = ((int32_t)p.scan << 4) - 32768;
-                int16_t pulse_wave = (saw_val > threshold) ? 32767 : -32768;
-                wave = q15_lerp(saw_val, pulse_wave,
-                               (table_pos - 2048) * 4);
-            }
-            else
-            {
-                // Pulse back to sine
-                int16_t saw_val = table_lookup(saw_table, phase[i]);
-                int32_t threshold = ((int32_t)p.scan << 4) - 32768;
-                int16_t pulse_wave = (saw_val > threshold) ? 32767 : -32768;
-                wave = q15_lerp(pulse_wave,
-                               table_lookup(sine_table, phase[i]),
-                               (table_pos - 3072) * 4);
-            }
-
-            if (p.warp < 2048)
-            {
-                // WARP CCW: bit reduction (8-bit down to 2-bit)
-                int32_t bits = 8 - ((int32_t)p.warp * 6 >> 11); // use full 0-2047 range
-                if (bits < 2) bits = 2;
-                if (bits < 8)
-                {
-                    // Quantize using shift instead of division (step is always power of 2)
-                    int32_t shift = 15 - bits; // equivalent to log2(32768 >> bits)
-                    wave = (int16_t)((wave >> shift) << shift);
-                }
-            }
-            else
-            {
-                // WARP CW: frequency cross-mod
-                int16_t sub = table_lookup(sine_table, phase[i] >> 1);
-                int32_t depth = (p.warp - 2048) * 2;
-                wave = q15_clip((int32_t)wave + (((int32_t)wave * sub >> 15) * depth >> 12));
-            }
-
-            // Pan
-            int32_t pan = i * 1365;
-            mix_l += ((int32_t)wave * (4095 - pan)) >> 14;
-            mix_r += ((int32_t)wave * pan) >> 14;
+            inc[i] = (uint32_t)((int64_t)p.basis_freq * ratio >> 16);
+            hinc[i] = inc[i] >> 1;
+            mip[i] = mip_for_inc(inc[i]);
         }
 
-        out_l = q15_clip(mix_l);
-        out_r = q15_clip(mix_r);
+        int32_t threshold = ((int32_t)p.scan << 4) - 32768; // pulse width (PWM)
+
+        // Run the pulse/bit-crush/cross-mod stage at 2x rate, then decimate. The
+        // bit reduction's quantization harmonics are intentional character; the
+        // 2x rate just keeps the hard-edged pulse from aliasing as harshly.
+        int16_t sub_l[2], sub_r[2];
+        for (int s = 0; s < 2; s++)
+        {
+            int32_t mix_l = 0, mix_r = 0;
+            for (int i = 0; i < 4; i++)
+            {
+                phase[i] += (s == 0) ? hinc[i] : (inc[i] - hinc[i]);
+
+                // Wavetable position: MORPH + per-osc offset from SCAN
+                int32_t table_pos = p.morph + ((int32_t)p.scan * (i + 1) * 307 >> 12);
+                table_pos &= 4095; // wrap
+
+                // Blend between waveforms (circular: sine→tri→saw→pulse→sine).
+                // Saw/tri use band-limited tables; the pulse threshold reads the
+                // clean ramp (saw_table) so PWM duty stays monotonic (no ripple).
+                int16_t wave;
+                if (table_pos < 1024)
+                {
+                    wave = q15_lerp(table_lookup(sine_table, phase[i]),
+                                   bl_lookup(tri_mips, phase[i], mip[i]),
+                                   table_pos * 4);
+                }
+                else if (table_pos < 2048)
+                {
+                    wave = q15_lerp(bl_lookup(tri_mips, phase[i], mip[i]),
+                                   bl_lookup(saw_mips, phase[i], mip[i]),
+                                   (table_pos - 1024) * 4);
+                }
+                else if (table_pos < 3072)
+                {
+                    int16_t saw_bl = bl_lookup(saw_mips, phase[i], mip[i]);
+                    int16_t saw_ramp = table_lookup(saw_table, phase[i]);
+                    int16_t pulse_wave = (saw_ramp > threshold) ? 32767 : -32768;
+                    wave = q15_lerp(saw_bl, pulse_wave, (table_pos - 2048) * 4);
+                }
+                else
+                {
+                    int16_t saw_ramp = table_lookup(saw_table, phase[i]);
+                    int16_t pulse_wave = (saw_ramp > threshold) ? 32767 : -32768;
+                    wave = q15_lerp(pulse_wave,
+                                   table_lookup(sine_table, phase[i]),
+                                   (table_pos - 3072) * 4);
+                }
+
+                if (p.warp < 2048)
+                {
+                    // WARP CCW: bit reduction (8-bit down to 2-bit)
+                    int32_t bits = 8 - ((int32_t)p.warp * 6 >> 11); // use full 0-2047 range
+                    if (bits < 2) bits = 2;
+                    if (bits < 8)
+                    {
+                        // Quantize using shift instead of division (step is always power of 2)
+                        int32_t shift = 15 - bits; // equivalent to log2(32768 >> bits)
+                        wave = (int16_t)((wave >> shift) << shift);
+                    }
+                }
+                else
+                {
+                    // WARP CW: frequency cross-mod
+                    int16_t sub = table_lookup(sine_table, phase[i] >> 1);
+                    int32_t depth = (p.warp - 2048) * 2;
+                    wave = q15_clip((int32_t)wave + (((int32_t)wave * sub >> 15) * depth >> 12));
+                }
+
+                // Pan
+                int32_t pan = i * 1365;
+                mix_l += ((int32_t)wave * (4095 - pan)) >> 14;
+                mix_r += ((int32_t)wave * pan) >> 14;
+            }
+            sub_l[s] = q15_clip(mix_l);
+            sub_r[s] = q15_clip(mix_r);
+        }
+
+        out_l = decim_l.process(sub_l[0], sub_l[1]);
+        out_r = decim_r.process(sub_r[0], sub_r[1]);
     }
 };
 

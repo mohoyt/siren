@@ -18,8 +18,9 @@ See [WORKSHOP_COMPUTER_AI_DIRECTIVE.md](WORKSHOP_COMPUTER_AI_DIRECTIVE.md) for t
 - **Fixed-point integer math throughout** — no floating point in the audio path
 - **One oscillator bank active at a time** — unlike the norns version which runs all 6 in parallel with SelectX crossfading. Bank transitions use fade-out → switch → fade-in (~84ms total) to stay within the RP2040's CPU budget.
 - **No internal effects/LFOs** — the module lives in a modular system where external modules handle delays, reverbs, filters, and modulation
-- **Wavetable lookup** for all waveforms (sine, saw, triangle) with linear interpolation
+- **Wavetable lookup** for all waveforms (sine, saw, triangle) with linear interpolation. Saw/triangle use **band-limited mipmaps** (`saw_mips`/`tri_mips`, 8 octave levels) selected per-oscillator by `mip_for_inc()` to keep the source waveforms from aliasing at 48 kHz. The plain `saw_table` ramp is retained only for the WAVE bank's PWM pulse threshold.
 - **Lookup tables for nonlinearities** (tanh, wavefold) stored in flash
+- **Anti-aliasing** — the real Vhikk-X runs at 96 kHz, which masks naïve DSP; Siren runs at 48 kHz, so the worst nonlinear banks (**WSHP, DTON, WAVE**) run their nonlinear cores at **2× oversampling** (96 kHz internal) and decimate back with a 7-tap half-band FIR (`Halfband2x` in `dsp.h`). Band-limited mipmaps (above) cover the source-waveform aliasing for the remaining banks. WAVE's bit-reduction grit is intentional and left intact.
 
 ### Files
 
